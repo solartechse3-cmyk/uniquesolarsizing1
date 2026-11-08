@@ -1726,6 +1726,54 @@ ${lic.token}
                   </label>
                 </div>
 
+                {/* Connected GitHub Pages & Web App Menu Status */}
+                <div className="p-4 rounded-2xl bg-gradient-to-r from-sky-950/70 via-slate-900 to-indigo-950/70 border border-sky-500/40 space-y-2.5 shadow-lg">
+                  <div className="flex items-center justify-between flex-wrap gap-2">
+                    <div className="flex items-center gap-2">
+                      <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                      <span className="text-xs font-extrabold text-white">
+                        {lang === 'my' ? 'ချိတ်ဆက်ထားသော GitHub Pages App လိပ်စာ:' : 'Connected GitHub Pages App Link:'}
+                      </span>
+                    </div>
+                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 font-bold border border-emerald-500/30">
+                      Telegram WebApp Connected
+                    </span>
+                  </div>
+
+                  <div className="p-2.5 rounded-xl bg-slate-950/80 border border-slate-800 flex items-center justify-between gap-2">
+                    <span className="font-mono text-xs text-cyan-300 font-bold truncate">
+                      https://solartechse3-cmyk.github.io/uniquesolarsizing1
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => copyToClipboard('https://solartechse3-cmyk.github.io/uniquesolarsizing1', 'gh_url')}
+                      className="p-1 text-slate-400 hover:text-white cursor-pointer shrink-0"
+                      title="Copy URL"
+                    >
+                      {copiedKey === 'gh_url' ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                    </button>
+                  </div>
+
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pt-1 text-[11px] text-slate-300">
+                    <span className="flex items-center gap-1.5">
+                      <span className="text-amber-400 font-bold">Bot Menu Button:</span>
+                      <span className="text-white font-mono bg-slate-950 px-2 py-0.5 rounded border border-slate-800">
+                        ☀️ Open Solar Pro
+                      </span>
+                    </span>
+                    <a
+                      href="https://t.me/UniqueSolarProLicenseBot"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1.5 text-sky-400 hover:text-sky-300 font-bold hover:underline"
+                    >
+                      <Send className="w-3 h-3" />
+                      <span>@UniqueSolarProLicenseBot သို့ ဖွင့်ကြည့်ရန်</span>
+                      <ExternalLink className="w-3 h-3" />
+                    </a>
+                  </div>
+                </div>
+
                 <div className="p-4 rounded-2xl bg-slate-950 border border-slate-800 space-y-4">
                   {/* Bot Token Field */}
                   <div className="space-y-1.5">

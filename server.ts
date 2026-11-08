@@ -523,13 +523,13 @@ const DEFAULT_INITIAL_ADMIN_CONTACT = {
 };
 
 const DEFAULT_INITIAL_TELEGRAM_BOT_CONFIG = {
-  enabled: false,
-  botToken: "",
-  botUsername: "",
-  adminChatId: "",
+  enabled: true,
+  botToken: "9212139270:AAEHgyL2ur0c_N1dW-uYkBhvdgYoRDUCuDk",
+  botUsername: "UniqueSolarProLicenseBot",
+  adminChatId: "1715154450",
   notifyOnActivation: true,
   notifyOnPayment: true,
-  lastTestedAt: ""
+  lastTestedAt: "2026-11-05T14:11:49.716Z"
 };
 
 const DEFAULT_INITIAL_SPEC_REQUESTS = [
@@ -1153,15 +1153,22 @@ async function sendTelegramChatAction(token: string, chatId: string, action: str
   } catch (e) {}
 }
 
-async function sendTelegramMessage(token: string, chatId: string, text: string, parseMode: 'HTML' | 'Markdown' = 'HTML') {
+async function sendTelegramMessage(
+  token: string, 
+  chatId: string, 
+  text: string, 
+  parseMode: 'HTML' | 'Markdown' = 'HTML',
+  replyMarkup?: any
+) {
   if (!token || !chatId) return { ok: false, description: 'Missing token or chatId' };
   try {
     const payload: any = {
       chat_id: chatId,
       text,
-      disable_web_page_preview: true
+      disable_web_page_preview: false
     };
     if (parseMode) payload.parse_mode = parseMode;
+    if (replyMarkup) payload.reply_markup = replyMarkup;
 
     let res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: 'POST',
@@ -1187,6 +1194,71 @@ async function sendTelegramMessage(token: string, chatId: string, text: string, 
   } catch (err: any) {
     console.error('Failed to send Telegram message:', err?.message);
     return { ok: false, description: err?.message };
+  }
+}
+
+async function syncTelegramBotProfileAndMenu(token: string, appUrl: string) {
+  if (!token) return { success: false, error: 'No token' };
+  const cleanUrl = (appUrl || getPublicAppUrl()).replace(/\/+$/, '');
+  try {
+    // 1. Set Chat Menu Button with Web App link to GitHub Pages
+    await fetch(`https://api.telegram.org/bot${token}/setChatMenuButton`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        menu_button: {
+          type: 'web_app',
+          text: '☀️ Open Solar Pro',
+          web_app: { url: cleanUrl }
+        }
+      }),
+      signal: AbortSignal.timeout(6000)
+    });
+
+    // 2. Set Commands list in Telegram
+    await fetch(`https://api.telegram.org/bot${token}/setMyCommands`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        commands: [
+          { command: 'start', description: 'Open App & Usage Guide' },
+          { command: 'app', description: 'Open Unique Solar Pro on GitHub Pages' },
+          { command: 'gen', description: '[Admin] /gen <name> <duration> [devices]' },
+          { command: 'licenses', description: '[Admin] View recent licenses' },
+          { command: 'csv', description: '[Admin] Download license Excel / CSV' },
+          { command: 'stats', description: '[Admin] Total licenses & bound devices' },
+          { command: 'id', description: 'View Telegram Chat ID' },
+          { command: 'help', description: 'Commands cheat sheet' }
+        ]
+      }),
+      signal: AbortSignal.timeout(6000)
+    });
+
+    // 3. Set Description for Bot Profile
+    await fetch(`https://api.telegram.org/bot${token}/setMyDescription`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        description: `☀️ UNIQUE SOLAR PRO - Engineering Suite ⚡️\nSolar Panel Sizing & Inverter Matching App for Engineers in Myanmar.\n\n🌐 Web App Link (VPN-Free):\n${cleanUrl}\n\n🔑 Instant 1-Click PRO License Activation & Management.`
+      }),
+      signal: AbortSignal.timeout(6000)
+    });
+
+    // 4. Set Short Description
+    await fetch(`https://api.telegram.org/bot${token}/setMyShortDescription`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        short_description: `Unique Solar Pro - ${cleanUrl}`
+      }),
+      signal: AbortSignal.timeout(6000)
+    });
+
+    console.log(`Telegram Bot profile & menu successfully synced with GitHub link: ${cleanUrl}`);
+    return { success: true, appUrl: cleanUrl };
+  } catch (err: any) {
+    console.warn('syncTelegramBotProfileAndMenu error:', err?.message);
+    return { success: false, error: err?.message };
   }
 }
 
@@ -1287,6 +1359,8 @@ function startTelegramPolling() {
   }
 
   isTelegramPolling = true;
+  // Automatically sync Telegram menu button & Web App link to point to GitHub Pages URL
+  syncTelegramBotProfileAndMenu(cfg.botToken, getPublicAppUrl()).catch(() => {});
   pollTelegramUpdates();
 }
 
@@ -1376,27 +1450,148 @@ async function handleTelegramIncomingMessage(cfg: any, msg: any) {
     broadcastSSE("telegram_bot", memoryStorage["telegram_bot"]);
   }
 
-  // Security check: Only allow adminChatId if configured
-  if (cfg.adminChatId && chatId !== String(cfg.adminChatId)) {
+  const parts = rawText.split(/\s+/);
+  const rawCmd = (parts[0] || '').toLowerCase();
+  const cmd = rawCmd.split('@')[0]; // handles /cmd@UniqueSolarProLicenseBot
+
+  const appUrl = getPublicAppUrl();
+  const isAdmin = !cfg.adminChatId || chatId === String(cfg.adminChatId);
+
+  // Command: /app, /link, /github, /web - Open Unique Solar Pro on GitHub Pages
+  if (cmd === '/app' || cmd === '/link' || cmd === '/github' || cmd === '/web' || cmd === '/url') {
+    const appMsg = `☀️ <b>UNIQUE SOLAR PRO - WEB APP</b> ⚡️
+━━━━━━━━━━━━━━━━━
+🌐 <b>GitHub Pages Link (VPN-Free):</b>
+${appUrl}
+
+💡 <b>အသုံးပြုပုံ:</b>
+မြန်မာနိုင်ငံရှိ မည်သည့်ဖုန်း၊ တက်ဘလက် သို့မဟုတ် ကွန်ပျူတာ Browser မှမဆို VPN မလိုဘဲ တိုက်ရိုက်ဖွင့်လှစ် အသုံးပြုနိုင်ပါသည်!`;
+
+    await sendTelegramMessage(cfg.botToken, chatId, appMsg, 'HTML', {
+      inline_keyboard: [
+        [
+          { text: '☀️ Open Solar Pro (Web App)', web_app: { url: appUrl } },
+          { text: '🌐 Direct Browser Link', url: appUrl }
+        ]
+      ]
+    });
+    return;
+  }
+
+  // Command: /id - Show chat ID
+  if (cmd === '/id') {
+    await sendTelegramMessage(cfg.botToken, chatId, `🆔 သင့် Telegram Chat ID သည်: <code>${chatId}</code> ဖြစ်ပါသည်။`, 'HTML');
+    return;
+  }
+
+  // Command: /check <token> - Check license status
+  if (cmd === '/check' || cmd === '/status' && parts[1]) {
+    const tokenQuery = parts[1] ? parts[1].trim().toUpperCase() : '';
+    if (!tokenQuery) {
+      await sendTelegramMessage(
+        cfg.botToken,
+        chatId,
+        `ℹ️ <b>လိုင်စင်စစ်ဆေးရန်:</b>\n<code>/check &lt;လိုင်စင်ကုဒ်&gt;</code> ပုံစံဖြင့် စစ်ဆေးနိုင်ပါသည်ခင်ဗျာ။\nဥပမာ: <code>/check SOLAR-PRO-1M-1D-XXXX-YYYY</code>`,
+        'HTML'
+      );
+      return;
+    }
+    const list = memoryStorage["licenses"] || [];
+    const found = list.find((l: any) => l.token.toUpperCase() === tokenQuery || l.id === tokenQuery);
+    if (!found) {
+      await sendTelegramMessage(
+        cfg.botToken,
+        chatId,
+        `❌ လိုင်စင်ကုဒ် <code>${tokenQuery}</code> အား စနစ်ထဲတွင် မတွေ့ရှိပါခင်ဗျာ။\nအသစ်ဝယ်ယူလိုပါက Admin သို့ ဆက်သွယ်နိုင်ပါသည်။`,
+        'HTML',
+        {
+          inline_keyboard: [
+            [
+              { text: '☀️ Open Unique Solar App', web_app: { url: appUrl } },
+              { text: '💬 Contact Admin', url: 'https://t.me/uniquesolarpro' }
+            ]
+          ]
+        }
+      );
+      return;
+    }
+    const boundCount = Array.isArray(found.boundDevices) ? found.boundDevices.length : 0;
+    const isExpired = new Date(found.expiresAt).getTime() < Date.now();
+    const statusText = isExpired ? '🔴 Expired' : found.status === 'active' ? '🟢 Active' : '🟡 Inactive';
+    const msg = `🔑 <b>PRO LICENSE STATUS</b>\n━━━━━━━━━━━━━━━━━\n👤 ဝယ်ယူသူ: <b>${found.customerName}</b>\n📊 Status: ${statusText}\n⏳ သက်တမ်း: ${found.duration}\n📅 ကုန်ဆုံးမည့်ရက်: ${new Date(found.expiresAt).toLocaleDateString()}\n📱 စက်ချိတ်ဆက်မှု: ${boundCount}/${found.deviceLimit} Devices\n\n🌐 <b>One-Click Link:</b>\n${appUrl}/?license=${found.token}`;
+    await sendTelegramMessage(cfg.botToken, chatId, msg, 'HTML', {
+      inline_keyboard: [
+        [
+          { text: '⚡️ 1-Click Activate', url: `${appUrl}/?license=${found.token}` },
+          { text: '☀️ Open App', web_app: { url: appUrl } }
+        ]
+      ]
+    });
+    return;
+  }
+
+  // Non-Admin Welcome / Start handling
+  if (!isAdmin) {
+    if (cmd === '/start' || cmd === '/help') {
+      const publicWelcome = `☀️ <b>UNIQUE SOLAR PRO</b> ⚡️
+မင်္ဂလာပါ <b>${fromName}</b>!
+မြန်မာနိုင်ငံရှိ Solar Engineers, Installers & Technicians များအတွက် အထူးထုတ်လုပ်ထားသော Solar Panel Sizing & Inverter Matching Engineering Suite ဖြစ်ပါသည်။
+
+🌐 <b>GitHub Pages App Link (VPN-Free):</b>
+${appUrl}
+
+⚡️ <b>ပါဝင်သော လုပ်ဆောင်ချက်များ:</b>
+• Inverter & Solar Panel String Sizing (Voc, Vmp, MPPT, Max/Min String)
+• 3D Solar Mounting Structure Calculators (Roof & Ground)
+• DC Breaker, Fuse, Cable & SPD Sizing
+• Engineering SLD & PDF Export
+
+💡 <b>PRO License ဝယ်ယူရန်/မေးမြန်းရန်:</b>
+• Telegram Admin: @uniquesolarpro
+• Viber Phone: 09 403 708 145
+
+🔑 <b>လိုင်စင်စစ်ဆေးရန်:</b>
+<code>/check &lt;LicenseKey&gt;</code>`;
+
+      await sendTelegramMessage(cfg.botToken, chatId, publicWelcome, 'HTML', {
+        inline_keyboard: [
+          [
+            { text: '☀️ Open Solar Pro (Web App)', web_app: { url: appUrl } },
+            { text: '🌐 Direct Browser Link', url: appUrl }
+          ],
+          [
+            { text: '💬 Contact Admin (@uniquesolarpro)', url: 'https://t.me/uniquesolarpro' }
+          ]
+        ]
+      });
+      return;
+    }
+
+    // Block non-admin from admin-only commands
     await sendTelegramMessage(
-      cfg.botToken, 
-      chatId, 
-      `⛔️ <b>ခွင့်ပြုချက်မရှိပါ။</b> ဤ Bot သည် Solar Pro Admin သီးသန့်အသုံးပြုရန် ဖြစ်ပါသည် (Unauthorized).\nသင့် Telegram Chat ID: <code>${chatId}</code>`,
-      'HTML'
+      cfg.botToken,
+      chatId,
+      `⛔️ <b>Admin Command ဖြစ်ပါသည်။</b>\nဤလုပ်ဆောင်ချက်သည် Solar Pro Admin သီးသန့်ဖြစ်ပါသည် (Unauthorized).\nသင့် Telegram Chat ID: <code>${chatId}</code>\n\n🌐 App ဖွင့်ရန်: ${appUrl}`,
+      'HTML',
+      {
+        inline_keyboard: [
+          [
+            { text: '☀️ Open Solar Pro', web_app: { url: appUrl } }
+          ]
+        ]
+      }
     );
     return;
   }
 
-  const parts = rawText.split(/\s+/);
-  const rawCmd = (parts[0] || '').toLowerCase();
-  const cmd = rawCmd.split('@')[0]; // handles /gen@UniqueSolarProLicenseBot
-
+  // --- ADMIN COMMANDS ---
   if (cmd === '/start' || cmd === '/help') {
-    const helpMsg = `☀️ <b>UNIQUE SOLAR PRO - LICENSE BOT</b> ⚡️
-မင်္ဂလာပါ <b>${fromName}</b>!
-ဤ Bot မှတစ်ဆင့် ဝယ်ယူသူများအတွက် PRO License Key နှင့် One-Click Activation Link များကို ချက်ချင်း ထုတ်ယူနိုင်ပါသည်:
+    const helpMsg = `☀️ <b>UNIQUE SOLAR PRO - ADMIN SUITE</b> ⚡️
+မင်္ဂလာပါ Admin <b>${fromName}</b>!
+Bot ချိတ်ဆက်ထားသော GitHub Pages Link:
+🌐 <code>${appUrl}</code>
 
-📌 <b>အသုံးပြုနိုင်သော Command များ:</b>
+📌 <b>အသုံးပြုနိုင်သော Admin Commands များ:</b>
 1️⃣ <b>လိုင်စင်ထုတ်ရန်:</b>
 <code>/gen &lt;နာမည်&gt; &lt;သက်တမ်း&gt; [စက်အရေအတွက်]</code>
 ဥပမာများ:
@@ -1413,21 +1608,27 @@ async function handleTelegramIncomingMessage(cfg: any, msg: any) {
 • <code>1y</code> = 1 Year (၃၆၅ ရက်)
 • <code>life</code> = Lifetime (၁၀ နှစ်)
 
-2️⃣ <b>ထုတ်ပြီးသား လိုင်စင်များ ကြည့်ရန် & ဒေါင်းလုဒ် ရယူရန်:</b>
+2️⃣ <b>လိုင်စင်များ ကြည့်ရန် & ဒေါင်းလုဒ် ရယူရန်:</b>
 • <code>/licenses</code> - နောက်ဆုံး ထုတ်ထားသော စာရင်းများ
 • <code>/csv</code> သို့မဟုတ် <code>/export</code> - စာရင်းအားလုံးကို Excel / CSV ဖိုင်ဖြင့် ဒေါင်းလုဒ် ရယူရန်
 
 3️⃣ <b>အခြေအနေ ကြည့်ရန်:</b>
-<code>/stats</code> - စုစုပေါင်း လိုင်စင်နှင့် စက်အရေအတွက်
+• <code>/stats</code> - စုစုပေါင်း လိုင်စင်နှင့် စက်အရေအတွက်
 
 4️⃣ <b>Chat ID ကြည့်ရန်:</b>
-<code>/id</code> - သင့် Telegram Chat ID: <code>${chatId}</code>`;
-    await sendTelegramMessage(cfg.botToken, chatId, helpMsg, 'HTML');
-    return;
-  }
+• <code>/id</code> - သင့် Telegram Chat ID: <code>${chatId}</code>
 
-  if (cmd === '/id') {
-    await sendTelegramMessage(cfg.botToken, chatId, `🆔 သင့် Telegram Chat ID သည်: <code>${chatId}</code> ဖြစ်ပါသည်။`, 'HTML');
+5️⃣ <b>GitHub App Link:</b>
+• <code>/app</code> - GitHub Pages App Link ရယူရန်`;
+
+    await sendTelegramMessage(cfg.botToken, chatId, helpMsg, 'HTML', {
+      inline_keyboard: [
+        [
+          { text: '☀️ Open Solar Pro (Web App)', web_app: { url: appUrl } },
+          { text: '🌐 Direct Browser Link', url: appUrl }
+        ]
+      ]
+    });
     return;
   }
 
@@ -1439,7 +1640,6 @@ async function handleTelegramIncomingMessage(cfg: any, msg: any) {
       return;
     }
 
-    const appUrl = getPublicAppUrl();
     const csvContent = generateLicensesCSV(list, appUrl);
     const dateStr = new Date().toISOString().split('T')[0];
     const filename = `Unique_Solar_Pro_Licenses_${dateStr}.csv`;
@@ -1450,7 +1650,7 @@ async function handleTelegramIncomingMessage(cfg: any, msg: any) {
       if (Array.isArray(l.boundDevices)) boundTotal += l.boundDevices.length;
     });
 
-    const caption = `📁 <b>PRO LICENSE DATABASE EXPORT (.CSV)</b>\n━━━━━━━━━━━━━━━━━\n🔑 စုစုပေါင်း: <b>${list.length}</b> ခု\n🟢 Active: <b>${active}</b> ခု\n📱 ချိတ်ဆက်စက်: <b>${boundTotal}</b> လုံး\n\n💡 ဤ CSV ဖိုင်အား Excel သို့မဟုတ် Google Sheets တွင် တိုက်ရိုက်ဖွင့်၍ ဖုန်း သို့မဟုတ် ကွန်ပျူတာတွင် အလွယ်တကူ သိမ်းဆည်း ကြည့်ရှုနိုင်ပါသည်!`;
+    const caption = `📁 <b>PRO LICENSE DATABASE EXPORT (.CSV)</b>\n━━━━━━━━━━━━━━━━━\n🔑 စုစုပေါင်း: <b>${list.length}</b> ခု\n🟢 Active: <b>${active}</b> ခု\n📱 ချိတ်ဆက်စက်: <b>${boundTotal}</b> လုံး\n🌐 App: ${appUrl}\n\n💡 ဤ CSV ဖိုင်အား Excel သို့မဟုတ် Google Sheets တွင် တိုက်ရိုက်ဖွင့်၍ ဖုန်း သို့မဟုတ် ကွန်ပျူတာတွင် အလွယ်တကူ သိမ်းဆည်း ကြည့်ရှုနိုင်ပါသည်!`;
 
     const sent = await sendTelegramDocument(cfg.botToken, chatId, filename, csvContent, caption);
     if (!sent) {
@@ -1499,9 +1699,7 @@ async function handleTelegramIncomingMessage(cfg: any, msg: any) {
       }
     }
 
-    const appUrl = getPublicAppUrl();
     const activationLink = `${appUrl}/?license=${newLic.token}`;
-
     const durLabel = duration === '1_week' ? '1 Week (7 Days)' : duration === '1_month' ? '1 Month (30 Days)' : duration === '3_months' ? '3 Months (90 Days)' : duration === '6_months' ? '6 Months (180 Days)' : duration === '1_year' ? '1 Year (365 Days)' : 'Lifetime (10 Years)';
 
     const dupNotice = isDuplicate ? '⚠️ <i>(လွန်ခဲ့သော စက္ကန့်ပိုင်းက ထုတ်ထားပြီးဖြစ်သော လိုင်စင်အား ပြန်လည်ပြသပေးထားပါသည် - Duplicate Prevented)</i>\n\n' : '';
@@ -1521,7 +1719,14 @@ ${activationLink}
 ━━━━━━━━━━━━━━━━━
 <i>(ဝယ်ယူသူထံ ဤစာတိုကို တိုက်ရိုက် Forward ပို့ပေးလိုက်ရုံဖြင့် အလွယ်တကူ Activate ပြုလုပ်နိုင်ပါသည်)</i>`;
 
-    await sendTelegramMessage(cfg.botToken, chatId, replyMsg, 'HTML');
+    await sendTelegramMessage(cfg.botToken, chatId, replyMsg, 'HTML', {
+      inline_keyboard: [
+        [
+          { text: '⚡️ 1-Click Activate PRO', url: activationLink },
+          { text: '☀️ Open App', url: appUrl }
+        ]
+      ]
+    });
     return;
   }
 
@@ -1539,7 +1744,13 @@ ${activationLink}
       reply += `${idx + 1}. ${statusIcon} <b>${lic.customerName}</b> (${lic.duration})\n   🔑 <code>${lic.token}</code>\n   📱 Active: ${boundCount}/${lic.deviceLimit} Devices\n\n`;
     });
     reply += `━━━━━━━━━━━━━━━━━\n💾 <b>စာရင်းအားလုံးကို Excel / CSV ဖိုင်ဖြင့် ဒေါင်းလုဒ် ရယူရန်:</b>\n<code>/csv</code> သို့မဟုတ် <code>/export</code> ဟု ရိုက်ပို့နိုင်ပါသည်ခင်ဗျာ!`;
-    await sendTelegramMessage(cfg.botToken, chatId, reply, 'HTML');
+    await sendTelegramMessage(cfg.botToken, chatId, reply, 'HTML', {
+      inline_keyboard: [
+        [
+          { text: '☀️ Open Solar Pro', web_app: { url: appUrl } }
+        ]
+      ]
+    });
     return;
   }
 
@@ -1556,8 +1767,15 @@ ${activationLink}
 🟢 Active Licenses: <b>${active}</b>
 📱 Total Bound Devices: <b>${boundTotal}</b>
 👥 Active User Sessions: <b>${sseClients.size}</b>
+🌐 Public GitHub App: ${appUrl}
 💾 Server Uptime: Online`;
-    await sendTelegramMessage(cfg.botToken, chatId, statsMsg, 'HTML');
+    await sendTelegramMessage(cfg.botToken, chatId, statsMsg, 'HTML', {
+      inline_keyboard: [
+        [
+          { text: '☀️ Open Solar Pro', web_app: { url: appUrl } }
+        ]
+      ]
+    });
     return;
   }
 
@@ -1565,8 +1783,15 @@ ${activationLink}
   await sendTelegramMessage(
     cfg.botToken, 
     chatId, 
-    `💡 လိုင်စင်ထုတ်ယူရန် <code>/gen &lt;နာမည်&gt; &lt;သက်တမ်း&gt; [စက်အရေအတွက်]</code> ဟု ရိုက်ပို့ပါခင်ဗျာ။\nဥပမာ: <code>/gen KoAung 1m 1</code>\nအသုံးပြုပုံ အပြည့်အစုံ ကြည့်ရန် <code>/help</code> ဟု ပို့ပေးပါ။`,
-    'HTML'
+    `💡 လိုင်စင်ထုတ်ယူရန် <code>/gen &lt;နာမည်&gt; &lt;သက်တမ်း&gt; [စက်အရေအတွက်]</code> ဟု ရိုက်ပို့ပါခင်ဗျာ။\nဥပမာ: <code>/gen KoAung 1m 1</code>\n🌐 App Link ရယူရန် <code>/app</code> ဟု ပို့ပေးပါ။`,
+    'HTML',
+    {
+      inline_keyboard: [
+        [
+          { text: '☀️ Open Solar Pro', web_app: { url: appUrl } }
+        ]
+      ]
+    }
   );
 }
 
@@ -1594,7 +1819,7 @@ app.post("/api/telegram/config", (req, res) => {
   res.json({ success: true, config: newConfig });
 });
 
-// Telegram Test Ping
+// Telegram Test Ping & Sync
 app.post("/api/telegram/test", async (req, res) => {
   try {
     const { botToken, adminChatId } = req.body;
@@ -1613,13 +1838,26 @@ app.post("/api/telegram/test", async (req, res) => {
     }
 
     const botUsername = meData.result?.username;
+    const appUrl = getPublicAppUrl();
+
+    // 2. Automatically sync Telegram Web App Menu button & Profile to point to GitHub Pages URL
+    await syncTelegramBotProfileAndMenu(token, appUrl);
+
     if (chatId) {
-      // 2. Send test message
+      // 3. Send test message with inline buttons
       const sendRes = await sendTelegramMessage(
         token, 
         chatId, 
-        `✅ <b>UNIQUE SOLAR PRO - Connection Success!</b> ⚡️\nBot: @${botUsername}\nStatus: Online & Ready to generate license links!`,
-        'HTML'
+        `✅ <b>UNIQUE SOLAR PRO - Connection Success!</b> ⚡️\nBot: @${botUsername}\n🌐 <b>GitHub Pages App:</b> ${appUrl}\nStatus: Online & Ready to generate license links!`,
+        'HTML',
+        {
+          inline_keyboard: [
+            [
+              { text: '☀️ Open Solar Pro (Web App)', web_app: { url: appUrl } },
+              { text: '🌐 Direct Browser Link', url: appUrl }
+            ]
+          ]
+        }
       );
       if (!sendRes.ok) {
         return res.status(400).json({
@@ -1649,12 +1887,28 @@ app.post("/api/telegram/test", async (req, res) => {
       success: true,
       botUsername,
       config: updatedCfg,
+      appUrl,
       message: chatId 
         ? `Bot @${botUsername} သို့ ချိတ်ဆက်မှု အောင်မြင်ပြီး Chat ID: ${chatId} သို့ စာတို ပို့ဆောင်ပြီးပါပြီ!`
         : `Bot @${botUsername} အတည်ပြုပြီးပါပြီ!`
     });
   } catch (err: any) {
     return res.status(500).json({ success: false, error: err?.message || 'Telegram test failed' });
+  }
+});
+
+// Sync Telegram Menu button & commands with GitHub Pages URL
+app.post("/api/telegram/sync-menu", async (req, res) => {
+  try {
+    const cfg = memoryStorage["telegram_bot"];
+    if (!cfg || !cfg.botToken) {
+      return res.status(400).json({ success: false, error: 'Telegram Bot is not configured yet' });
+    }
+    const appUrl = getPublicAppUrl();
+    const result = await syncTelegramBotProfileAndMenu(cfg.botToken, appUrl);
+    return res.json(result);
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || 'Sync failed' });
   }
 });
 

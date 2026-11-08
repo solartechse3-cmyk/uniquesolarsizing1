@@ -324,11 +324,30 @@ export const LicenseActivationModal: React.FC<LicenseActivationModalProps> = ({
                         <Send className="w-4 h-4" />
                       </div>
                       <div>
-                        <span className="text-[10px] uppercase font-bold text-cyan-200 block">Telegram Contact</span>
+                        <span className="text-[10px] uppercase font-bold text-cyan-200 block">Telegram Admin</span>
                         <span className="font-mono font-bold text-sm tracking-wide">@{tgUser}</span>
                       </div>
                     </div>
                     <ExternalLink className="w-4 h-4 text-cyan-200 group-hover:translate-x-0.5 transition-transform" />
+                  </a>
+
+                  {/* Telegram Automated License Bot */}
+                  <a
+                    href="https://t.me/UniqueSolarProLicenseBot"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="col-span-1 sm:col-span-2 p-3 rounded-2xl bg-slate-900 border border-sky-500/30 text-white flex items-center justify-between shadow-md hover:border-sky-500/60 transition-all group"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <div className="w-8 h-8 rounded-xl bg-sky-500/20 text-sky-400 flex items-center justify-center shrink-0">
+                        <Sparkles className="w-4 h-4" />
+                      </div>
+                      <div>
+                        <span className="text-[10px] uppercase font-bold text-sky-400 block">Automated Telegram License Bot</span>
+                        <span className="font-mono font-bold text-xs text-slate-200">@UniqueSolarProLicenseBot (Instant 1-Click Link)</span>
+                      </div>
+                    </div>
+                    <ExternalLink className="w-4 h-4 text-sky-400 group-hover:translate-x-0.5 transition-transform" />
                   </a>
                 </div>
 

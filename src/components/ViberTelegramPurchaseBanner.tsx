@@ -385,15 +385,27 @@ export const ViberTelegramPurchaseBanner: React.FC<ViberTelegramPurchaseBannerPr
                     </div>
 
                     {/* Action Button: Open Telegram */}
-                    <a
-                      href={telegramLink}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="w-full py-2.5 px-4 rounded-xl bg-[#229ed9] hover:bg-[#1b8bc2] text-white text-xs font-black transition-all shadow-md shadow-cyan-600/25 flex items-center justify-center gap-2 active:scale-95 text-center"
-                    >
-                      <span>Telegram ဖြင့် စာပို့ဝယ်ယူရန်</span>
-                      <ExternalLink className="w-3.5 h-3.5" />
-                    </a>
+                    <div className="flex flex-col sm:flex-row gap-2 w-full">
+                      <a
+                        href={telegramLink}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="flex-1 py-2.5 px-3 rounded-xl bg-[#229ed9] hover:bg-[#1b8bc2] text-white text-xs font-black transition-all shadow-md shadow-cyan-600/25 flex items-center justify-center gap-1.5 active:scale-95 text-center"
+                      >
+                        <span>Admin ထံ စာပို့ရန်</span>
+                        <ExternalLink className="w-3.5 h-3.5" />
+                      </a>
+                      <a
+                        href="https://t.me/UniqueSolarProLicenseBot"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="py-2.5 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-sky-300 border border-sky-500/30 text-xs font-bold transition-all flex items-center justify-center gap-1.5 active:scale-95 text-center"
+                        title="Telegram License Bot"
+                      >
+                        <span>🤖 License Bot</span>
+                        <ExternalLink className="w-3.5 h-3.5" />
+                      </a>
+                    </div>
                   </div>
                 </div>
 

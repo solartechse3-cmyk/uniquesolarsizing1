@@ -2474,6 +2474,10 @@ export async function activateLicenseOnDevice(token: string): Promise<{
       };
 
       saveStoredActiveLicense(offlineLicense);
+
+      // Real-time Telegram notification to Admin when user activates on GitHub Pages
+      notifyTelegramOnClientActivation(offlineLicense, deviceModel, deviceId).catch(() => {});
+
       return {
         success: true,
         license: offlineLicense,
@@ -2709,29 +2713,78 @@ export async function publishLiveSystemUpdate(
 // ----------------------------------------------------
 
 export const DEFAULT_INITIAL_TELEGRAM_BOT_CONFIG: TelegramBotConfig = {
-  enabled: false,
-  botToken: '',
-  botUsername: '',
-  adminChatId: '',
+  enabled: true,
+  botToken: '9212139270:AAEHgyL2ur0c_N1dW-uYkBhvdgYoRDUCuDk',
+  botUsername: 'UniqueSolarProLicenseBot',
+  adminChatId: '1715154450',
   notifyOnActivation: true,
   notifyOnPayment: true,
-  lastTestedAt: ''
+  lastTestedAt: '2026-11-05T14:11:49.716Z'
 };
 
+const STORAGE_TELEGRAM_CONFIG_KEY = 'solar_sizer_telegram_config_v1';
+
 export async function fetchTelegramConfigFromCloud(): Promise<TelegramBotConfig> {
+  // 1. Try local storage cache
+  try {
+    const raw = localStorage.getItem(STORAGE_TELEGRAM_CONFIG_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.botToken) return { ...DEFAULT_INITIAL_TELEGRAM_BOT_CONFIG, ...parsed };
+    }
+  } catch (e) {}
+
+  // 2. Try Server API
   try {
     const res = await fetch('/api/telegram/config');
     if (res.ok) {
       const data = await res.json();
       if (data.success && data.config) {
-        return data.config;
+        localStorage.setItem(STORAGE_TELEGRAM_CONFIG_KEY, JSON.stringify(data.config));
+        return { ...DEFAULT_INITIAL_TELEGRAM_BOT_CONFIG, ...data.config };
       }
     }
   } catch (e) {}
+
+  // 3. Try Supabase app_settings
+  const client = initSupabase();
+  if (client) {
+    try {
+      const { data } = await client.from('app_settings').select('value').eq('id', 'telegram_bot_config').maybeSingle();
+      if (data && data.value && data.value.botToken) {
+        localStorage.setItem(STORAGE_TELEGRAM_CONFIG_KEY, JSON.stringify(data.value));
+        return { ...DEFAULT_INITIAL_TELEGRAM_BOT_CONFIG, ...data.value };
+      }
+    } catch (e) {}
+  }
+
   return DEFAULT_INITIAL_TELEGRAM_BOT_CONFIG;
 }
 
 export async function saveTelegramConfigToCloud(config: TelegramBotConfig): Promise<{ success: boolean; config?: TelegramBotConfig; error?: string }> {
+  // 1. Save to localStorage
+  try {
+    localStorage.setItem(STORAGE_TELEGRAM_CONFIG_KEY, JSON.stringify(config));
+  } catch (e) {}
+
+  // 2. Sync menu button directly to Telegram with GitHub Pages URL
+  if (config.botToken) {
+    syncTelegramMenuWithGitHub(config.botToken, 'https://solartechse3-cmyk.github.io/uniquesolarsizing1').catch(() => {});
+  }
+
+  // 3. Save to Supabase
+  const client = initSupabase();
+  if (client) {
+    try {
+      await client.from('app_settings').upsert({
+        id: 'telegram_bot_config',
+        value: config,
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'id' });
+    } catch (e) {}
+  }
+
+  // 4. Try Server API
   try {
     const res = await fetch('/api/telegram/config', {
       method: 'POST',
@@ -2742,7 +2795,57 @@ export async function saveTelegramConfigToCloud(config: TelegramBotConfig): Prom
       const data = await res.json();
       return { success: true, config: data.config };
     }
-    return { success: false, error: 'Failed to save telegram config' };
+  } catch (err: any) {}
+
+  return { success: true, config };
+}
+
+export async function syncTelegramMenuWithGitHub(
+  token?: string, 
+  appUrl: string = 'https://solartechse3-cmyk.github.io/uniquesolarsizing1'
+): Promise<{ success: boolean; message?: string; error?: string }> {
+  const botToken = token || DEFAULT_INITIAL_TELEGRAM_BOT_CONFIG.botToken;
+  if (!botToken) return { success: false, error: 'Telegram Bot Token is required' };
+  const cleanUrl = appUrl.replace(/\/+$/, '');
+
+  try {
+    // 1. Set Chat Menu Button with Web App link
+    const resMenu = await fetch(`https://api.telegram.org/bot${botToken}/setChatMenuButton`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        menu_button: {
+          type: 'web_app',
+          text: '☀️ Open Solar Pro',
+          web_app: { url: cleanUrl }
+        }
+      })
+    });
+    const menuData = await resMenu.json();
+
+    // 2. Set Description
+    await fetch(`https://api.telegram.org/bot${botToken}/setMyDescription`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        description: `☀️ UNIQUE SOLAR PRO - Engineering Suite ⚡️\nSolar Panel Sizing & Inverter Matching App for Engineers in Myanmar.\n\n🌐 Web App Link (VPN-Free):\n${cleanUrl}\n\n🔑 Instant 1-Click PRO License Activation & Management.`
+      })
+    }).catch(() => {});
+
+    // 3. Set Short Description
+    await fetch(`https://api.telegram.org/bot${botToken}/setMyShortDescription`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        short_description: `Unique Solar Pro - ${cleanUrl}`
+      })
+    }).catch(() => {});
+
+    if (menuData.ok) {
+      return { success: true, message: `Telegram Bot Menu Button successfully connected to ${cleanUrl}!` };
+    } else {
+      return { success: false, error: menuData.description || 'Failed to update menu button' };
+    }
   } catch (err: any) {
     return { success: false, error: err?.message || 'Network error' };
   }
@@ -2758,9 +2861,82 @@ export async function testTelegramBotConnection(
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ botToken, adminChatId })
     });
-    const data = await res.json();
-    return data;
+    if (res.ok) {
+      const data = await res.json();
+      return data;
+    }
+  } catch (e) {}
+
+  // Client-side fallback test directly with Telegram API
+  const token = botToken || DEFAULT_INITIAL_TELEGRAM_BOT_CONFIG.botToken;
+  if (!token) return { success: false, error: 'Telegram Bot Token ထည့်သွင်းပေးပါခင်ဗျာ' };
+
+  try {
+    const meRes = await fetch(`https://api.telegram.org/bot${token}/getMe`);
+    const meData = await meRes.json();
+    if (!meData.ok) {
+      return { success: false, error: `Bot Token မှားယွင်းနေပါသည်: ${meData.description}` };
+    }
+    const username = meData.result?.username;
+    const appUrl = 'https://solartechse3-cmyk.github.io/uniquesolarsizing1';
+
+    // Sync menu button directly
+    syncTelegramMenuWithGitHub(token, appUrl).catch(() => {});
+
+    if (adminChatId) {
+      await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: adminChatId,
+          text: `✅ <b>UNIQUE SOLAR PRO - Telegram Bot Connected!</b> ⚡️\nBot: @${username}\n🌐 <b>GitHub Pages App:</b> ${appUrl}\nStatus: Online & Ready!`,
+          parse_mode: 'HTML',
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: '☀️ Open Solar Pro (Web App)', web_app: { url: appUrl } },
+                { text: '🌐 Direct Browser Link', url: appUrl }
+              ]
+            ]
+          }
+        })
+      });
+    }
+
+    return {
+      success: true,
+      botUsername: username,
+      message: adminChatId 
+        ? `Bot @${username} သို့ ချိတ်ဆက်မှု အောင်မြင်ပြီး Chat ID: ${adminChatId} သို့ စာတို ပို့ဆောင်ပြီးပါပြီ!`
+        : `Bot @${username} အတည်ပြုပြီးပါပြီ!`
+    };
   } catch (err: any) {
     return { success: false, error: err?.message || 'Connection test failed' };
   }
+}
+
+export async function notifyTelegramOnClientActivation(
+  license: LicenseToken, 
+  deviceModel: string, 
+  deviceId: string
+): Promise<void> {
+  try {
+    const cfg = await fetchTelegramConfigFromCloud();
+    if (cfg && cfg.enabled && cfg.botToken && cfg.adminChatId && cfg.notifyOnActivation) {
+      const boundCount = license.boundDevices?.length || 1;
+      const devLimit = license.deviceLimit || 1;
+      const expireStr = new Date(license.expiresAt).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+      const text = `🔔 <b>PRO License Activated on Buyer Device!</b>\n━━━━━━━━━━━━━━━━━\n👤 <b>Customer:</b> ${license.customerName || 'Valued Engineer'}\n📱 <b>Device:</b> ${deviceModel}\n🆔 <b>Device ID:</b> <code>${deviceId}</code>\n🔑 <b>License Key:</b> <code>${license.token}</code>\n⏳ <b>Expires At:</b> ${expireStr}\n📊 <b>Devices:</b> ${boundCount}/${devLimit}\n🌐 <b>Origin:</b> GitHub Pages (https://solartechse3-cmyk.github.io/uniquesolarsizing1)`;
+
+      fetch(`https://api.telegram.org/bot${cfg.botToken}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: cfg.adminChatId,
+          text,
+          parse_mode: 'HTML'
+        })
+      }).catch(() => {});
+    }
+  } catch (e) {}
 }

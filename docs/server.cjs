@@ -509,13 +509,13 @@ var DEFAULT_INITIAL_ADMIN_CONTACT = {
   noteEn: "Contact via Viber or Telegram to purchase 1 Week, 1 Month, 3 Months PRO License Link"
 };
 var DEFAULT_INITIAL_TELEGRAM_BOT_CONFIG = {
-  enabled: false,
-  botToken: "",
-  botUsername: "",
-  adminChatId: "",
+  enabled: true,
+  botToken: "9212139270:AAEHgyL2ur0c_N1dW-uYkBhvdgYoRDUCuDk",
+  botUsername: "UniqueSolarProLicenseBot",
+  adminChatId: "1715154450",
   notifyOnActivation: true,
   notifyOnPayment: true,
-  lastTestedAt: ""
+  lastTestedAt: "2026-11-05T14:11:49.716Z"
 };
 var DEFAULT_INITIAL_SPEC_REQUESTS = [
   {
@@ -1044,15 +1044,16 @@ async function sendTelegramChatAction(token, chatId, action = "typing") {
   } catch (e) {
   }
 }
-async function sendTelegramMessage(token, chatId, text, parseMode = "HTML") {
+async function sendTelegramMessage(token, chatId, text, parseMode = "HTML", replyMarkup) {
   if (!token || !chatId) return { ok: false, description: "Missing token or chatId" };
   try {
     const payload = {
       chat_id: chatId,
       text,
-      disable_web_page_preview: true
+      disable_web_page_preview: false
     };
     if (parseMode) payload.parse_mode = parseMode;
+    if (replyMarkup) payload.reply_markup = replyMarkup;
     let res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1075,6 +1076,68 @@ async function sendTelegramMessage(token, chatId, text, parseMode = "HTML") {
   } catch (err) {
     console.error("Failed to send Telegram message:", err?.message);
     return { ok: false, description: err?.message };
+  }
+}
+async function syncTelegramBotProfileAndMenu(token, appUrl) {
+  if (!token) return { success: false, error: "No token" };
+  const cleanUrl = (appUrl || getPublicAppUrl()).replace(/\/+$/, "");
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/setChatMenuButton`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        menu_button: {
+          type: "web_app",
+          text: "\u2600\uFE0F Open Solar Pro",
+          web_app: { url: cleanUrl }
+        }
+      }),
+      signal: AbortSignal.timeout(6e3)
+    });
+    await fetch(`https://api.telegram.org/bot${token}/setMyCommands`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        commands: [
+          { command: "start", description: "Open App & Usage Guide" },
+          { command: "app", description: "Open Unique Solar Pro on GitHub Pages" },
+          { command: "gen", description: "[Admin] /gen <name> <duration> [devices]" },
+          { command: "licenses", description: "[Admin] View recent licenses" },
+          { command: "csv", description: "[Admin] Download license Excel / CSV" },
+          { command: "stats", description: "[Admin] Total licenses & bound devices" },
+          { command: "id", description: "View Telegram Chat ID" },
+          { command: "help", description: "Commands cheat sheet" }
+        ]
+      }),
+      signal: AbortSignal.timeout(6e3)
+    });
+    await fetch(`https://api.telegram.org/bot${token}/setMyDescription`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        description: `\u2600\uFE0F UNIQUE SOLAR PRO - Engineering Suite \u26A1\uFE0F
+Solar Panel Sizing & Inverter Matching App for Engineers in Myanmar.
+
+\u{1F310} Web App Link (VPN-Free):
+${cleanUrl}
+
+\u{1F511} Instant 1-Click PRO License Activation & Management.`
+      }),
+      signal: AbortSignal.timeout(6e3)
+    });
+    await fetch(`https://api.telegram.org/bot${token}/setMyShortDescription`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        short_description: `Unique Solar Pro - ${cleanUrl}`
+      }),
+      signal: AbortSignal.timeout(6e3)
+    });
+    console.log(`Telegram Bot profile & menu successfully synced with GitHub link: ${cleanUrl}`);
+    return { success: true, appUrl: cleanUrl };
+  } catch (err) {
+    console.warn("syncTelegramBotProfileAndMenu error:", err?.message);
+    return { success: false, error: err?.message };
   }
 }
 async function sendTelegramDocument(token, chatId, filename, content, caption) {
@@ -1165,6 +1228,8 @@ function startTelegramPolling() {
     return;
   }
   isTelegramPolling = true;
+  syncTelegramBotProfileAndMenu(cfg.botToken, getPublicAppUrl()).catch(() => {
+  });
   pollTelegramUpdates();
 }
 async function pollTelegramUpdates() {
@@ -1233,25 +1298,149 @@ async function handleTelegramIncomingMessage(cfg, msg) {
     saveStorageToDisk();
     broadcastSSE("telegram_bot", memoryStorage["telegram_bot"]);
   }
-  if (cfg.adminChatId && chatId !== String(cfg.adminChatId)) {
-    await sendTelegramMessage(
-      cfg.botToken,
-      chatId,
-      `\u26D4\uFE0F <b>\u1001\u103D\u1004\u1037\u103A\u1015\u103C\u102F\u1001\u103B\u1000\u103A\u1019\u101B\u103E\u102D\u1015\u102B\u104B</b> \u1024 Bot \u101E\u100A\u103A Solar Pro Admin \u101E\u102E\u1038\u101E\u1014\u1037\u103A\u1021\u101E\u102F\u1036\u1038\u1015\u103C\u102F\u101B\u1014\u103A \u1016\u103C\u1005\u103A\u1015\u102B\u101E\u100A\u103A (Unauthorized).
-\u101E\u1004\u1037\u103A Telegram Chat ID: <code>${chatId}</code>`,
-      "HTML"
-    );
-    return;
-  }
   const parts = rawText.split(/\s+/);
   const rawCmd = (parts[0] || "").toLowerCase();
   const cmd = rawCmd.split("@")[0];
-  if (cmd === "/start" || cmd === "/help") {
-    const helpMsg = `\u2600\uFE0F <b>UNIQUE SOLAR PRO - LICENSE BOT</b> \u26A1\uFE0F
-\u1019\u1004\u103A\u1039\u1002\u101C\u102C\u1015\u102B <b>${fromName}</b>!
-\u1024 Bot \u1019\u103E\u1010\u1005\u103A\u1006\u1004\u1037\u103A \u101D\u101A\u103A\u101A\u1030\u101E\u1030\u1019\u103B\u102C\u1038\u1021\u1010\u103D\u1000\u103A PRO License Key \u1014\u103E\u1004\u1037\u103A One-Click Activation Link \u1019\u103B\u102C\u1038\u1000\u102D\u102F \u1001\u103B\u1000\u103A\u1001\u103B\u1004\u103A\u1038 \u1011\u102F\u1010\u103A\u101A\u1030\u1014\u102D\u102F\u1004\u103A\u1015\u102B\u101E\u100A\u103A:
+  const appUrl = getPublicAppUrl();
+  const isAdmin = !cfg.adminChatId || chatId === String(cfg.adminChatId);
+  if (cmd === "/app" || cmd === "/link" || cmd === "/github" || cmd === "/web" || cmd === "/url") {
+    const appMsg = `\u2600\uFE0F <b>UNIQUE SOLAR PRO - WEB APP</b> \u26A1\uFE0F
+\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
+\u{1F310} <b>GitHub Pages Link (VPN-Free):</b>
+${appUrl}
 
-\u{1F4CC} <b>\u1021\u101E\u102F\u1036\u1038\u1015\u103C\u102F\u1014\u102D\u102F\u1004\u103A\u101E\u1031\u102C Command \u1019\u103B\u102C\u1038:</b>
+\u{1F4A1} <b>\u1021\u101E\u102F\u1036\u1038\u1015\u103C\u102F\u1015\u102F\u1036:</b>
+\u1019\u103C\u1014\u103A\u1019\u102C\u1014\u102D\u102F\u1004\u103A\u1004\u1036\u101B\u103E\u102D \u1019\u100A\u103A\u101E\u100A\u1037\u103A\u1016\u102F\u1014\u103A\u1038\u104A \u1010\u1000\u103A\u1018\u101C\u1000\u103A \u101E\u102D\u102F\u1037\u1019\u101F\u102F\u1010\u103A \u1000\u103D\u1014\u103A\u1015\u103B\u1030\u1010\u102C Browser \u1019\u103E\u1019\u1006\u102D\u102F VPN \u1019\u101C\u102D\u102F\u1018\u1032 \u1010\u102D\u102F\u1000\u103A\u101B\u102D\u102F\u1000\u103A\u1016\u103D\u1004\u1037\u103A\u101C\u103E\u1005\u103A \u1021\u101E\u102F\u1036\u1038\u1015\u103C\u102F\u1014\u102D\u102F\u1004\u103A\u1015\u102B\u101E\u100A\u103A!`;
+    await sendTelegramMessage(cfg.botToken, chatId, appMsg, "HTML", {
+      inline_keyboard: [
+        [
+          { text: "\u2600\uFE0F Open Solar Pro (Web App)", web_app: { url: appUrl } },
+          { text: "\u{1F310} Direct Browser Link", url: appUrl }
+        ]
+      ]
+    });
+    return;
+  }
+  if (cmd === "/id") {
+    await sendTelegramMessage(cfg.botToken, chatId, `\u{1F194} \u101E\u1004\u1037\u103A Telegram Chat ID \u101E\u100A\u103A: <code>${chatId}</code> \u1016\u103C\u1005\u103A\u1015\u102B\u101E\u100A\u103A\u104B`, "HTML");
+    return;
+  }
+  if (cmd === "/check" || cmd === "/status" && parts[1]) {
+    const tokenQuery = parts[1] ? parts[1].trim().toUpperCase() : "";
+    if (!tokenQuery) {
+      await sendTelegramMessage(
+        cfg.botToken,
+        chatId,
+        `\u2139\uFE0F <b>\u101C\u102D\u102F\u1004\u103A\u1005\u1004\u103A\u1005\u1005\u103A\u1006\u1031\u1038\u101B\u1014\u103A:</b>
+<code>/check &lt;\u101C\u102D\u102F\u1004\u103A\u1005\u1004\u103A\u1000\u102F\u1012\u103A&gt;</code> \u1015\u102F\u1036\u1005\u1036\u1016\u103C\u1004\u1037\u103A \u1005\u1005\u103A\u1006\u1031\u1038\u1014\u102D\u102F\u1004\u103A\u1015\u102B\u101E\u100A\u103A\u1001\u1004\u103A\u1017\u103B\u102C\u104B
+\u1025\u1015\u1019\u102C: <code>/check SOLAR-PRO-1M-1D-XXXX-YYYY</code>`,
+        "HTML"
+      );
+      return;
+    }
+    const list = memoryStorage["licenses"] || [];
+    const found = list.find((l) => l.token.toUpperCase() === tokenQuery || l.id === tokenQuery);
+    if (!found) {
+      await sendTelegramMessage(
+        cfg.botToken,
+        chatId,
+        `\u274C \u101C\u102D\u102F\u1004\u103A\u1005\u1004\u103A\u1000\u102F\u1012\u103A <code>${tokenQuery}</code> \u1021\u102C\u1038 \u1005\u1014\u1005\u103A\u1011\u1032\u1010\u103D\u1004\u103A \u1019\u1010\u103D\u1031\u1037\u101B\u103E\u102D\u1015\u102B\u1001\u1004\u103A\u1017\u103B\u102C\u104B
+\u1021\u101E\u1005\u103A\u101D\u101A\u103A\u101A\u1030\u101C\u102D\u102F\u1015\u102B\u1000 Admin \u101E\u102D\u102F\u1037 \u1006\u1000\u103A\u101E\u103D\u101A\u103A\u1014\u102D\u102F\u1004\u103A\u1015\u102B\u101E\u100A\u103A\u104B`,
+        "HTML",
+        {
+          inline_keyboard: [
+            [
+              { text: "\u2600\uFE0F Open Unique Solar App", web_app: { url: appUrl } },
+              { text: "\u{1F4AC} Contact Admin", url: "https://t.me/uniquesolarpro" }
+            ]
+          ]
+        }
+      );
+      return;
+    }
+    const boundCount = Array.isArray(found.boundDevices) ? found.boundDevices.length : 0;
+    const isExpired = new Date(found.expiresAt).getTime() < Date.now();
+    const statusText = isExpired ? "\u{1F534} Expired" : found.status === "active" ? "\u{1F7E2} Active" : "\u{1F7E1} Inactive";
+    const msg2 = `\u{1F511} <b>PRO LICENSE STATUS</b>
+\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
+\u{1F464} \u101D\u101A\u103A\u101A\u1030\u101E\u1030: <b>${found.customerName}</b>
+\u{1F4CA} Status: ${statusText}
+\u23F3 \u101E\u1000\u103A\u1010\u1019\u103A\u1038: ${found.duration}
+\u{1F4C5} \u1000\u102F\u1014\u103A\u1006\u102F\u1036\u1038\u1019\u100A\u1037\u103A\u101B\u1000\u103A: ${new Date(found.expiresAt).toLocaleDateString()}
+\u{1F4F1} \u1005\u1000\u103A\u1001\u103B\u102D\u1010\u103A\u1006\u1000\u103A\u1019\u103E\u102F: ${boundCount}/${found.deviceLimit} Devices
+
+\u{1F310} <b>One-Click Link:</b>
+${appUrl}/?license=${found.token}`;
+    await sendTelegramMessage(cfg.botToken, chatId, msg2, "HTML", {
+      inline_keyboard: [
+        [
+          { text: "\u26A1\uFE0F 1-Click Activate", url: `${appUrl}/?license=${found.token}` },
+          { text: "\u2600\uFE0F Open App", web_app: { url: appUrl } }
+        ]
+      ]
+    });
+    return;
+  }
+  if (!isAdmin) {
+    if (cmd === "/start" || cmd === "/help") {
+      const publicWelcome = `\u2600\uFE0F <b>UNIQUE SOLAR PRO</b> \u26A1\uFE0F
+\u1019\u1004\u103A\u1039\u1002\u101C\u102C\u1015\u102B <b>${fromName}</b>!
+\u1019\u103C\u1014\u103A\u1019\u102C\u1014\u102D\u102F\u1004\u103A\u1004\u1036\u101B\u103E\u102D Solar Engineers, Installers & Technicians \u1019\u103B\u102C\u1038\u1021\u1010\u103D\u1000\u103A \u1021\u1011\u1030\u1038\u1011\u102F\u1010\u103A\u101C\u102F\u1015\u103A\u1011\u102C\u1038\u101E\u1031\u102C Solar Panel Sizing & Inverter Matching Engineering Suite \u1016\u103C\u1005\u103A\u1015\u102B\u101E\u100A\u103A\u104B
+
+\u{1F310} <b>GitHub Pages App Link (VPN-Free):</b>
+${appUrl}
+
+\u26A1\uFE0F <b>\u1015\u102B\u101D\u1004\u103A\u101E\u1031\u102C \u101C\u102F\u1015\u103A\u1006\u1031\u102C\u1004\u103A\u1001\u103B\u1000\u103A\u1019\u103B\u102C\u1038:</b>
+\u2022 Inverter & Solar Panel String Sizing (Voc, Vmp, MPPT, Max/Min String)
+\u2022 3D Solar Mounting Structure Calculators (Roof & Ground)
+\u2022 DC Breaker, Fuse, Cable & SPD Sizing
+\u2022 Engineering SLD & PDF Export
+
+\u{1F4A1} <b>PRO License \u101D\u101A\u103A\u101A\u1030\u101B\u1014\u103A/\u1019\u1031\u1038\u1019\u103C\u1014\u103A\u1038\u101B\u1014\u103A:</b>
+\u2022 Telegram Admin: @uniquesolarpro
+\u2022 Viber Phone: 09 403 708 145
+
+\u{1F511} <b>\u101C\u102D\u102F\u1004\u103A\u1005\u1004\u103A\u1005\u1005\u103A\u1006\u1031\u1038\u101B\u1014\u103A:</b>
+<code>/check &lt;LicenseKey&gt;</code>`;
+      await sendTelegramMessage(cfg.botToken, chatId, publicWelcome, "HTML", {
+        inline_keyboard: [
+          [
+            { text: "\u2600\uFE0F Open Solar Pro (Web App)", web_app: { url: appUrl } },
+            { text: "\u{1F310} Direct Browser Link", url: appUrl }
+          ],
+          [
+            { text: "\u{1F4AC} Contact Admin (@uniquesolarpro)", url: "https://t.me/uniquesolarpro" }
+          ]
+        ]
+      });
+      return;
+    }
+    await sendTelegramMessage(
+      cfg.botToken,
+      chatId,
+      `\u26D4\uFE0F <b>Admin Command \u1016\u103C\u1005\u103A\u1015\u102B\u101E\u100A\u103A\u104B</b>
+\u1024\u101C\u102F\u1015\u103A\u1006\u1031\u102C\u1004\u103A\u1001\u103B\u1000\u103A\u101E\u100A\u103A Solar Pro Admin \u101E\u102E\u1038\u101E\u1014\u1037\u103A\u1016\u103C\u1005\u103A\u1015\u102B\u101E\u100A\u103A (Unauthorized).
+\u101E\u1004\u1037\u103A Telegram Chat ID: <code>${chatId}</code>
+
+\u{1F310} App \u1016\u103D\u1004\u1037\u103A\u101B\u1014\u103A: ${appUrl}`,
+      "HTML",
+      {
+        inline_keyboard: [
+          [
+            { text: "\u2600\uFE0F Open Solar Pro", web_app: { url: appUrl } }
+          ]
+        ]
+      }
+    );
+    return;
+  }
+  if (cmd === "/start" || cmd === "/help") {
+    const helpMsg = `\u2600\uFE0F <b>UNIQUE SOLAR PRO - ADMIN SUITE</b> \u26A1\uFE0F
+\u1019\u1004\u103A\u1039\u1002\u101C\u102C\u1015\u102B Admin <b>${fromName}</b>!
+Bot \u1001\u103B\u102D\u1010\u103A\u1006\u1000\u103A\u1011\u102C\u1038\u101E\u1031\u102C GitHub Pages Link:
+\u{1F310} <code>${appUrl}</code>
+
+\u{1F4CC} <b>\u1021\u101E\u102F\u1036\u1038\u1015\u103C\u102F\u1014\u102D\u102F\u1004\u103A\u101E\u1031\u102C Admin Commands \u1019\u103B\u102C\u1038:</b>
 1\uFE0F\u20E3 <b>\u101C\u102D\u102F\u1004\u103A\u1005\u1004\u103A\u1011\u102F\u1010\u103A\u101B\u1014\u103A:</b>
 <code>/gen &lt;\u1014\u102C\u1019\u100A\u103A&gt; &lt;\u101E\u1000\u103A\u1010\u1019\u103A\u1038&gt; [\u1005\u1000\u103A\u1021\u101B\u1031\u1021\u1010\u103D\u1000\u103A]</code>
 \u1025\u1015\u1019\u102C\u1019\u103B\u102C\u1038:
@@ -1268,20 +1457,26 @@ async function handleTelegramIncomingMessage(cfg, msg) {
 \u2022 <code>1y</code> = 1 Year (\u1043\u1046\u1045 \u101B\u1000\u103A)
 \u2022 <code>life</code> = Lifetime (\u1041\u1040 \u1014\u103E\u1005\u103A)
 
-2\uFE0F\u20E3 <b>\u1011\u102F\u1010\u103A\u1015\u103C\u102E\u1038\u101E\u102C\u1038 \u101C\u102D\u102F\u1004\u103A\u1005\u1004\u103A\u1019\u103B\u102C\u1038 \u1000\u103C\u100A\u1037\u103A\u101B\u1014\u103A & \u1012\u1031\u102B\u1004\u103A\u1038\u101C\u102F\u1012\u103A \u101B\u101A\u1030\u101B\u1014\u103A:</b>
+2\uFE0F\u20E3 <b>\u101C\u102D\u102F\u1004\u103A\u1005\u1004\u103A\u1019\u103B\u102C\u1038 \u1000\u103C\u100A\u1037\u103A\u101B\u1014\u103A & \u1012\u1031\u102B\u1004\u103A\u1038\u101C\u102F\u1012\u103A \u101B\u101A\u1030\u101B\u1014\u103A:</b>
 \u2022 <code>/licenses</code> - \u1014\u1031\u102C\u1000\u103A\u1006\u102F\u1036\u1038 \u1011\u102F\u1010\u103A\u1011\u102C\u1038\u101E\u1031\u102C \u1005\u102C\u101B\u1004\u103A\u1038\u1019\u103B\u102C\u1038
 \u2022 <code>/csv</code> \u101E\u102D\u102F\u1037\u1019\u101F\u102F\u1010\u103A <code>/export</code> - \u1005\u102C\u101B\u1004\u103A\u1038\u1021\u102C\u1038\u101C\u102F\u1036\u1038\u1000\u102D\u102F Excel / CSV \u1016\u102D\u102F\u1004\u103A\u1016\u103C\u1004\u1037\u103A \u1012\u1031\u102B\u1004\u103A\u1038\u101C\u102F\u1012\u103A \u101B\u101A\u1030\u101B\u1014\u103A
 
 3\uFE0F\u20E3 <b>\u1021\u1001\u103C\u1031\u1021\u1014\u1031 \u1000\u103C\u100A\u1037\u103A\u101B\u1014\u103A:</b>
-<code>/stats</code> - \u1005\u102F\u1005\u102F\u1015\u1031\u102B\u1004\u103A\u1038 \u101C\u102D\u102F\u1004\u103A\u1005\u1004\u103A\u1014\u103E\u1004\u1037\u103A \u1005\u1000\u103A\u1021\u101B\u1031\u1021\u1010\u103D\u1000\u103A
+\u2022 <code>/stats</code> - \u1005\u102F\u1005\u102F\u1015\u1031\u102B\u1004\u103A\u1038 \u101C\u102D\u102F\u1004\u103A\u1005\u1004\u103A\u1014\u103E\u1004\u1037\u103A \u1005\u1000\u103A\u1021\u101B\u1031\u1021\u1010\u103D\u1000\u103A
 
 4\uFE0F\u20E3 <b>Chat ID \u1000\u103C\u100A\u1037\u103A\u101B\u1014\u103A:</b>
-<code>/id</code> - \u101E\u1004\u1037\u103A Telegram Chat ID: <code>${chatId}</code>`;
-    await sendTelegramMessage(cfg.botToken, chatId, helpMsg, "HTML");
-    return;
-  }
-  if (cmd === "/id") {
-    await sendTelegramMessage(cfg.botToken, chatId, `\u{1F194} \u101E\u1004\u1037\u103A Telegram Chat ID \u101E\u100A\u103A: <code>${chatId}</code> \u1016\u103C\u1005\u103A\u1015\u102B\u101E\u100A\u103A\u104B`, "HTML");
+\u2022 <code>/id</code> - \u101E\u1004\u1037\u103A Telegram Chat ID: <code>${chatId}</code>
+
+5\uFE0F\u20E3 <b>GitHub App Link:</b>
+\u2022 <code>/app</code> - GitHub Pages App Link \u101B\u101A\u1030\u101B\u1014\u103A`;
+    await sendTelegramMessage(cfg.botToken, chatId, helpMsg, "HTML", {
+      inline_keyboard: [
+        [
+          { text: "\u2600\uFE0F Open Solar Pro (Web App)", web_app: { url: appUrl } },
+          { text: "\u{1F310} Direct Browser Link", url: appUrl }
+        ]
+      ]
+    });
     return;
   }
   if (cmd === "/export" || cmd === "/csv" || cmd === "/download") {
@@ -1291,7 +1486,6 @@ async function handleTelegramIncomingMessage(cfg, msg) {
       await sendTelegramMessage(cfg.botToken, chatId, `\u{1F4DD} \u1011\u102F\u1010\u103A\u1011\u102C\u1038\u101E\u1031\u102C \u101C\u102D\u102F\u1004\u103A\u1005\u1004\u103A \u1019\u103E\u1010\u103A\u1010\u1019\u103A\u1038 \u1019\u101B\u103E\u102D\u101E\u1031\u1038\u1015\u102B\u1001\u1004\u103A\u1017\u103B\u102C\u104B <code>/gen</code> \u1016\u103C\u1004\u1037\u103A \u1005\u1010\u1004\u103A\u1011\u102F\u1010\u103A\u1014\u102D\u102F\u1004\u103A\u1015\u102B\u101E\u100A\u103A\u104B`, "HTML");
       return;
     }
-    const appUrl = getPublicAppUrl();
     const csvContent = generateLicensesCSV(list, appUrl);
     const dateStr = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
     const filename = `Unique_Solar_Pro_Licenses_${dateStr}.csv`;
@@ -1305,6 +1499,7 @@ async function handleTelegramIncomingMessage(cfg, msg) {
 \u{1F511} \u1005\u102F\u1005\u102F\u1015\u1031\u102B\u1004\u103A\u1038: <b>${list.length}</b> \u1001\u102F
 \u{1F7E2} Active: <b>${active}</b> \u1001\u102F
 \u{1F4F1} \u1001\u103B\u102D\u1010\u103A\u1006\u1000\u103A\u1005\u1000\u103A: <b>${boundTotal}</b> \u101C\u102F\u1036\u1038
+\u{1F310} App: ${appUrl}
 
 \u{1F4A1} \u1024 CSV \u1016\u102D\u102F\u1004\u103A\u1021\u102C\u1038 Excel \u101E\u102D\u102F\u1037\u1019\u101F\u102F\u1010\u103A Google Sheets \u1010\u103D\u1004\u103A \u1010\u102D\u102F\u1000\u103A\u101B\u102D\u102F\u1000\u103A\u1016\u103D\u1004\u1037\u103A\u104D \u1016\u102F\u1014\u103A\u1038 \u101E\u102D\u102F\u1037\u1019\u101F\u102F\u1010\u103A \u1000\u103D\u1014\u103A\u1015\u103B\u1030\u1010\u102C\u1010\u103D\u1004\u103A \u1021\u101C\u103D\u101A\u103A\u1010\u1000\u1030 \u101E\u102D\u1019\u103A\u1038\u1006\u100A\u103A\u1038 \u1000\u103C\u100A\u1037\u103A\u101B\u103E\u102F\u1014\u102D\u102F\u1004\u103A\u1015\u102B\u101E\u100A\u103A!`;
     const sent = await sendTelegramDocument(cfg.botToken, chatId, filename, csvContent, caption);
@@ -1347,7 +1542,6 @@ async function handleTelegramIncomingMessage(cfg, msg) {
         if (oldest) recentCommandCache.delete(oldest);
       }
     }
-    const appUrl = getPublicAppUrl();
     const activationLink = `${appUrl}/?license=${newLic.token}`;
     const durLabel = duration === "1_week" ? "1 Week (7 Days)" : duration === "1_month" ? "1 Month (30 Days)" : duration === "3_months" ? "3 Months (90 Days)" : duration === "6_months" ? "6 Months (180 Days)" : duration === "1_year" ? "1 Year (365 Days)" : "Lifetime (10 Years)";
     const dupNotice = isDuplicate ? "\u26A0\uFE0F <i>(\u101C\u103D\u1014\u103A\u1001\u1032\u1037\u101E\u1031\u102C \u1005\u1000\u1039\u1000\u1014\u1037\u103A\u1015\u102D\u102F\u1004\u103A\u1038\u1000 \u1011\u102F\u1010\u103A\u1011\u102C\u1038\u1015\u103C\u102E\u1038\u1016\u103C\u1005\u103A\u101E\u1031\u102C \u101C\u102D\u102F\u1004\u103A\u1005\u1004\u103A\u1021\u102C\u1038 \u1015\u103C\u1014\u103A\u101C\u100A\u103A\u1015\u103C\u101E\u1015\u1031\u1038\u1011\u102C\u1038\u1015\u102B\u101E\u100A\u103A - Duplicate Prevented)</i>\n\n" : "";
@@ -1365,7 +1559,14 @@ ${activationLink}
 <i>\u{1F449} \u1021\u1000\u101A\u103A\u104D Link \u1019\u1016\u103D\u1004\u1037\u103A\u1001\u103B\u1004\u103A\u1015\u102B\u1000 App \u104F "Enter License Key" \u1010\u103D\u1004\u103A \u1024 Key \u1000\u102D\u102F \u1000\u1030\u1038\u1011\u100A\u1037\u103A\u101B\u102F\u1036\u1016\u103C\u1004\u1037\u103A\u101C\u100A\u103A\u1038 VPN \u1019\u101C\u102D\u102F\u1018\u1032 Activate \u1016\u103C\u1005\u103A\u1015\u102B\u101E\u100A\u103A!</i>
 \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
 <i>(\u101D\u101A\u103A\u101A\u1030\u101E\u1030\u1011\u1036 \u1024\u1005\u102C\u1010\u102D\u102F\u1000\u102D\u102F \u1010\u102D\u102F\u1000\u103A\u101B\u102D\u102F\u1000\u103A Forward \u1015\u102D\u102F\u1037\u1015\u1031\u1038\u101C\u102D\u102F\u1000\u103A\u101B\u102F\u1036\u1016\u103C\u1004\u1037\u103A \u1021\u101C\u103D\u101A\u103A\u1010\u1000\u1030 Activate \u1015\u103C\u102F\u101C\u102F\u1015\u103A\u1014\u102D\u102F\u1004\u103A\u1015\u102B\u101E\u100A\u103A)</i>`;
-    await sendTelegramMessage(cfg.botToken, chatId, replyMsg, "HTML");
+    await sendTelegramMessage(cfg.botToken, chatId, replyMsg, "HTML", {
+      inline_keyboard: [
+        [
+          { text: "\u26A1\uFE0F 1-Click Activate PRO", url: activationLink },
+          { text: "\u2600\uFE0F Open App", url: appUrl }
+        ]
+      ]
+    });
     return;
   }
   if (cmd === "/licenses") {
@@ -1390,7 +1591,13 @@ ${activationLink}
     reply += `\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
 \u{1F4BE} <b>\u1005\u102C\u101B\u1004\u103A\u1038\u1021\u102C\u1038\u101C\u102F\u1036\u1038\u1000\u102D\u102F Excel / CSV \u1016\u102D\u102F\u1004\u103A\u1016\u103C\u1004\u1037\u103A \u1012\u1031\u102B\u1004\u103A\u1038\u101C\u102F\u1012\u103A \u101B\u101A\u1030\u101B\u1014\u103A:</b>
 <code>/csv</code> \u101E\u102D\u102F\u1037\u1019\u101F\u102F\u1010\u103A <code>/export</code> \u101F\u102F \u101B\u102D\u102F\u1000\u103A\u1015\u102D\u102F\u1037\u1014\u102D\u102F\u1004\u103A\u1015\u102B\u101E\u100A\u103A\u1001\u1004\u103A\u1017\u103B\u102C!`;
-    await sendTelegramMessage(cfg.botToken, chatId, reply, "HTML");
+    await sendTelegramMessage(cfg.botToken, chatId, reply, "HTML", {
+      inline_keyboard: [
+        [
+          { text: "\u2600\uFE0F Open Solar Pro", web_app: { url: appUrl } }
+        ]
+      ]
+    });
     return;
   }
   if (cmd === "/stats") {
@@ -1406,8 +1613,15 @@ ${activationLink}
 \u{1F7E2} Active Licenses: <b>${active}</b>
 \u{1F4F1} Total Bound Devices: <b>${boundTotal}</b>
 \u{1F465} Active User Sessions: <b>${sseClients.size}</b>
+\u{1F310} Public GitHub App: ${appUrl}
 \u{1F4BE} Server Uptime: Online`;
-    await sendTelegramMessage(cfg.botToken, chatId, statsMsg, "HTML");
+    await sendTelegramMessage(cfg.botToken, chatId, statsMsg, "HTML", {
+      inline_keyboard: [
+        [
+          { text: "\u2600\uFE0F Open Solar Pro", web_app: { url: appUrl } }
+        ]
+      ]
+    });
     return;
   }
   await sendTelegramMessage(
@@ -1415,8 +1629,15 @@ ${activationLink}
     chatId,
     `\u{1F4A1} \u101C\u102D\u102F\u1004\u103A\u1005\u1004\u103A\u1011\u102F\u1010\u103A\u101A\u1030\u101B\u1014\u103A <code>/gen &lt;\u1014\u102C\u1019\u100A\u103A&gt; &lt;\u101E\u1000\u103A\u1010\u1019\u103A\u1038&gt; [\u1005\u1000\u103A\u1021\u101B\u1031\u1021\u1010\u103D\u1000\u103A]</code> \u101F\u102F \u101B\u102D\u102F\u1000\u103A\u1015\u102D\u102F\u1037\u1015\u102B\u1001\u1004\u103A\u1017\u103B\u102C\u104B
 \u1025\u1015\u1019\u102C: <code>/gen KoAung 1m 1</code>
-\u1021\u101E\u102F\u1036\u1038\u1015\u103C\u102F\u1015\u102F\u1036 \u1021\u1015\u103C\u100A\u1037\u103A\u1021\u1005\u102F\u1036 \u1000\u103C\u100A\u1037\u103A\u101B\u1014\u103A <code>/help</code> \u101F\u102F \u1015\u102D\u102F\u1037\u1015\u1031\u1038\u1015\u102B\u104B`,
-    "HTML"
+\u{1F310} App Link \u101B\u101A\u1030\u101B\u1014\u103A <code>/app</code> \u101F\u102F \u1015\u102D\u102F\u1037\u1015\u1031\u1038\u1015\u102B\u104B`,
+    "HTML",
+    {
+      inline_keyboard: [
+        [
+          { text: "\u2600\uFE0F Open Solar Pro", web_app: { url: appUrl } }
+        ]
+      ]
+    }
   );
 }
 app.get("/api/telegram/config", (req, res) => {
@@ -1451,14 +1672,25 @@ app.post("/api/telegram/test", async (req, res) => {
       return res.status(400).json({ success: false, error: `Bot Token \u1019\u103E\u102C\u1038\u101A\u103D\u1004\u103A\u1038\u1014\u1031\u1015\u102B\u101E\u100A\u103A: ${meData.description}` });
     }
     const botUsername = meData.result?.username;
+    const appUrl = getPublicAppUrl();
+    await syncTelegramBotProfileAndMenu(token, appUrl);
     if (chatId) {
       const sendRes = await sendTelegramMessage(
         token,
         chatId,
         `\u2705 <b>UNIQUE SOLAR PRO - Connection Success!</b> \u26A1\uFE0F
 Bot: @${botUsername}
+\u{1F310} <b>GitHub Pages App:</b> ${appUrl}
 Status: Online & Ready to generate license links!`,
-        "HTML"
+        "HTML",
+        {
+          inline_keyboard: [
+            [
+              { text: "\u2600\uFE0F Open Solar Pro (Web App)", web_app: { url: appUrl } },
+              { text: "\u{1F310} Direct Browser Link", url: appUrl }
+            ]
+          ]
+        }
       );
       if (!sendRes.ok) {
         return res.status(400).json({
@@ -1485,10 +1717,24 @@ Status: Online & Ready to generate license links!`,
       success: true,
       botUsername,
       config: updatedCfg,
+      appUrl,
       message: chatId ? `Bot @${botUsername} \u101E\u102D\u102F\u1037 \u1001\u103B\u102D\u1010\u103A\u1006\u1000\u103A\u1019\u103E\u102F \u1021\u1031\u102C\u1004\u103A\u1019\u103C\u1004\u103A\u1015\u103C\u102E\u1038 Chat ID: ${chatId} \u101E\u102D\u102F\u1037 \u1005\u102C\u1010\u102D\u102F \u1015\u102D\u102F\u1037\u1006\u1031\u102C\u1004\u103A\u1015\u103C\u102E\u1038\u1015\u102B\u1015\u103C\u102E!` : `Bot @${botUsername} \u1021\u1010\u100A\u103A\u1015\u103C\u102F\u1015\u103C\u102E\u1038\u1015\u102B\u1015\u103C\u102E!`
     });
   } catch (err) {
     return res.status(500).json({ success: false, error: err?.message || "Telegram test failed" });
+  }
+});
+app.post("/api/telegram/sync-menu", async (req, res) => {
+  try {
+    const cfg = memoryStorage["telegram_bot"];
+    if (!cfg || !cfg.botToken) {
+      return res.status(400).json({ success: false, error: "Telegram Bot is not configured yet" });
+    }
+    const appUrl = getPublicAppUrl();
+    const result = await syncTelegramBotProfileAndMenu(cfg.botToken, appUrl);
+    return res.json(result);
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err?.message || "Sync failed" });
   }
 });
 app.post("/api/telegram/webhook", async (req, res) => {
