@@ -1,0 +1,163 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "Cascadia Code", Consolas, "Liberation Mono", Menlo, monospace;
+}
+
+@utility animate-spin-slow {
+  animation: spin 20s linear infinite;
+}
+
+@utility glass-card-dark {
+  background: linear-gradient(135deg, rgba(15, 23, 42, 0.85) 0%, rgba(10, 15, 29, 0.95) 100%);
+  backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+@utility glass-card-light {
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.95) 0%, rgba(248, 250, 252, 0.9) 100%);
+  backdrop-filter: blur(16px);
+  border: 1px solid rgba(226, 232, 240, 0.9);
+}
+
+/* ----------------------------------------------------
+   PROFESSIONAL A4 PRINT & PRINTER INTEGRATION STYLESHEET
+   ---------------------------------------------------- */
+@media print {
+  @page {
+    size: A4 portrait;
+    margin: 8mm 10mm 8mm 10mm;
+  }
+
+  html, body {
+    width: 100% !important;
+    height: auto !important;
+    background: #ffffff !important;
+    color: #0f172a !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: visible !important;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  *, *::before, *::after {
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+    color-adjust: exact !important;
+  }
+
+  /* Hide all app navigation, headers, sidebars and non-printable overlays */
+  nav, header, aside, footer,
+  .no-print,
+  .print-hidden,
+  button,
+  [role="dialog"] > div:first-child:not(.a4-page-container) {
+    display: none !important;
+  }
+
+  /* Un-fix modal overlays during print so they don't clip */
+  .fixed {
+    position: static !important;
+    background: transparent !important;
+    backdrop-filter: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    display: block !important;
+    overflow: visible !important;
+  }
+
+  /* Printable container styling */
+  #dc-breaker-print-sheet,
+  #solar-mounting-print-sheet,
+  #cad-print-sheet,
+  #digital-receipt-printable,
+  #a4-site-survey-printable,
+  #a4-load-calc-printable,
+  .a4-page-container {
+    visibility: visible !important;
+    position: relative !important;
+    left: 0 !important;
+    top: 0 !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    margin: 0 auto !important;
+    padding: 0 !important;
+    box-shadow: none !important;
+    border: none !important;
+    border-radius: 0 !important;
+    background: #ffffff !important;
+    color: #0f172a !important;
+    display: block !important;
+    page-break-inside: auto !important;
+    break-inside: auto !important;
+  }
+
+  #dc-breaker-print-sheet *,
+  #solar-mounting-print-sheet *,
+  #cad-print-sheet *,
+  #digital-receipt-printable *,
+  #a4-site-survey-printable *,
+  #a4-load-calc-printable *,
+  .a4-page-container * {
+    visibility: visible !important;
+    color-adjust: exact !important;
+    -webkit-print-color-adjust: exact !important;
+  }
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Custom sleek scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.3);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(245, 158, 11, 0.5);
+}
+
+/* Dedicated visible horizontal scrollbar for wide array matrix & schematic */
+.array-scroll-container {
+  overflow-x: auto !important;
+  overflow-y: hidden;
+  max-width: 100%;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(245, 158, 11, 0.7) rgba(15, 23, 42, 0.8);
+  -webkit-overflow-scrolling: touch;
+}
+
+.array-scroll-container::-webkit-scrollbar {
+  height: 9px !important;
+}
+
+.array-scroll-container::-webkit-scrollbar-track {
+  background: rgba(15, 23, 42, 0.9) !important;
+  border-radius: 9999px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.array-scroll-container::-webkit-scrollbar-thumb {
+  background: linear-gradient(90deg, #f59e0b, #d97706) !important;
+  border-radius: 9999px;
+  border: 2px solid rgba(15, 23, 42, 0.9);
+}
+
+.array-scroll-container::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(90deg, #fbbf24, #f59e0b) !important;
+}

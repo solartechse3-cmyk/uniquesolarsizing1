@@ -1,0 +1,8 @@
+{
+  "name": "Remix Remix Remix Solar Panel Calculator0411",
+  "description": "An interactive solar panel sizing calculator for inverters to calculate maximum, minimum, and recommended panel configurations per string.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
