@@ -497,9 +497,9 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
     setIsPublishing(true);
     setPublishSuccessMsg(null);
     try {
-      // Fast timeout race to ensure Publishing... never gets stuck
+      // Generous timeout race to ensure Publishing... completes cleanly with Supabase
       const timeoutPromise = new Promise<{ success: boolean }>((resolve) => 
-        setTimeout(() => resolve({ success: true }), 1800)
+        setTimeout(() => resolve({ success: true }), 4000)
       );
       await Promise.race([
         onPublishLiveUpdate('Admin published live suite update'),
@@ -604,7 +604,7 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
     const custom = (brandingForm.customAppUrl || '').trim();
     const appUrl = (custom && custom.startsWith('http')) 
       ? custom.replace(/\/+$/, '') 
-      : 'https://solartechse3-cmyk.github.io/uniquesolarsizing';
+      : 'https://solartechse3-cmyk.github.io/uniquesolarsizing1';
     const link = `${appUrl}/?license=${lic.token}`;
     const durMy = lic.duration === '1_week' ? '၁ ပတ် (1 Week)' : lic.duration === '1_month' ? '၁ လ (1 Month)' : lic.duration === '3_months' ? '၃ လ (3 Months)' : lic.duration === '6_months' ? '၆ လ (6 Months)' : lic.duration === '1_year' ? '၁ နှစ် (1 Year)' : 'တစ်သက်တာ (Lifetime)';
     const devMy = lic.deviceLimit === 2 ? '၂ လုံး (2 Devices)' : '၁ လုံး (1 Device)';
@@ -1011,11 +1011,11 @@ ${lic.token}
                           <span className="text-[10px] text-emerald-400 font-bold block uppercase">Direct Activation Link (VPN-Free)</span>
                           <div className="flex items-center justify-between gap-1">
                             <span className="font-mono text-xs text-amber-300 truncate">
-                              {`${((brandingForm.customAppUrl || '').trim() || 'https://solartechse3-cmyk.github.io/uniquesolarsizing').replace(/\/+$/, '')}/?license=${generatedResult.token}`}
+                              {`${((brandingForm.customAppUrl || '').trim() || 'https://solartechse3-cmyk.github.io/uniquesolarsizing1').replace(/\/+$/, '')}/?license=${generatedResult.token}`}
                             </span>
                             <button
                               type="button"
-                              onClick={() => copyToClipboard(`${((brandingForm.customAppUrl || '').trim() || 'https://solartechse3-cmyk.github.io/uniquesolarsizing').replace(/\/+$/, '')}/?license=${generatedResult.token}`, 'gen_link')}
+                              onClick={() => copyToClipboard(`${((brandingForm.customAppUrl || '').trim() || 'https://solartechse3-cmyk.github.io/uniquesolarsizing1').replace(/\/+$/, '')}/?license=${generatedResult.token}`, 'gen_link')}
                               className="p-1 text-slate-300 hover:text-white cursor-pointer"
                               title="Copy Link"
                             >
@@ -1150,7 +1150,7 @@ ${lic.token}
                         const isExpired = new Date(lic.expiresAt).getTime() < Date.now();
                         const boundCount = lic.boundDevices?.length || 0;
                         const daysLeft = Math.max(0, Math.ceil((new Date(lic.expiresAt).getTime() - Date.now()) / 86400000));
-                        const appUrl = ((brandingForm.customAppUrl || '').trim() || 'https://solartechse3-cmyk.github.io/uniquesolarsizing').replace(/\/+$/, '');
+                        const appUrl = ((brandingForm.customAppUrl || '').trim() || 'https://solartechse3-cmyk.github.io/uniquesolarsizing1').replace(/\/+$/, '');
                         const shareLink = `${appUrl}/?license=${lic.token}`;
 
                         return (
@@ -1477,9 +1477,13 @@ ${lic.token}
                 </div>
 
                 <div className="p-4 rounded-2xl bg-slate-950 border border-slate-800 space-y-3">
-                  <div className="flex items-center justify-between">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                     <span className="font-bold text-xs text-slate-300">
                       CSV File Batch Upload (ဆိုလာပြား / အင်ဗာတာ ဖိုင်တင်ရန်)
+                    </span>
+                    <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                      {lang === 'my' ? 'Supabase Auto-Sync ချိတ်ဆက်ထားသည် (GitHub တွင် တန်းပေါ်မည်)' : 'Supabase Live Cloud Sync Active (Auto on GitHub)'}
                     </span>
                   </div>
 
@@ -1928,7 +1932,7 @@ ${lic.token}
                       type="url"
                       value={brandingForm.customAppUrl || ''}
                       onChange={(e) => setBrandingForm({ ...brandingForm, customAppUrl: e.target.value })}
-                      placeholder="https://solartechse3-cmyk.github.io/uniquesolarsizing"
+                      placeholder="https://solartechse3-cmyk.github.io/uniquesolarsizing1"
                       className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-700 text-cyan-300 text-xs font-mono focus:border-cyan-500 focus:outline-none"
                     />
                     <p className="text-[11px] text-slate-400 leading-relaxed">

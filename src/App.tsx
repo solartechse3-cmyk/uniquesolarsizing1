@@ -2034,7 +2034,15 @@ export default function App() {
   };
 
   const handlePublishLiveUpdate = async (note?: string) => {
-    const res = await publishLiveSystemUpdate(note);
+    const res = await publishLiveSystemUpdate(note, {
+      inverters: customInverters,
+      panels: customPanels,
+      batteries: customBatteries,
+      mountingDatabase: mountingDatabase,
+      adminContact: adminContact,
+      adminResources: adminResources,
+      appBranding: appBranding
+    });
     return res;
   };
 
@@ -2622,6 +2630,13 @@ export default function App() {
       localStorage.setItem('solar_sizer_custom_inverters_v3', JSON.stringify(inverters));
     } catch (e) {}
     await saveCustomInvertersToCloud(inverters);
+    // Instantly publish to Supabase Cloud and notify all active GitHub Pages users
+    publishLiveSystemUpdate('Inverters updated via CSV batch upload', {
+      inverters,
+      panels: customPanels,
+      batteries: customBatteries,
+      mountingDatabase
+    }).catch(() => {});
   };
 
   const handleUpdateCustomPanels = async (panels: PanelPreset[]) => {
@@ -2631,6 +2646,13 @@ export default function App() {
       localStorage.setItem('solar_sizer_custom_panels_v3', JSON.stringify(sanitized));
     } catch (e) {}
     await saveCustomPanelsToCloud(sanitized);
+    // Instantly publish to Supabase Cloud and notify all active GitHub Pages users
+    publishLiveSystemUpdate('Solar Panels updated via CSV batch upload', {
+      inverters: customInverters,
+      panels: sanitized,
+      batteries: customBatteries,
+      mountingDatabase
+    }).catch(() => {});
   };
 
   // Export/Download current list of inverters to CSV file

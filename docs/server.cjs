@@ -504,7 +504,7 @@ var DEFAULT_INITIAL_ADMIN_CONTACT = {
   viberUrl: "viber://chat?number=09403708145",
   telegramUsername: "uniquesolarpro",
   telegramUrl: "https://t.me/uniquesolarpro",
-  customAppUrl: "https://solartechse3-cmyk.github.io/uniquesolarsizing",
+  customAppUrl: "https://solartechse3-cmyk.github.io/uniquesolarsizing1",
   noteMy: "Viber \u101E\u102D\u102F\u1037\u1019\u101F\u102F\u1010\u103A Telegram \u1010\u103D\u1004\u103A \u1006\u1000\u103A\u101E\u103D\u101A\u103A\u104D 1 Week, 1 Month, 3 Months PRO License Link \u101B\u101A\u1030\u1014\u102D\u102F\u1004\u103A\u1015\u102B\u101E\u100A\u103A",
   noteEn: "Contact via Viber or Telegram to purchase 1 Week, 1 Month, 3 Months PRO License Link"
 };
@@ -801,7 +801,7 @@ function getPublicAppUrl() {
   if (custom && typeof custom === "string" && custom.trim().startsWith("http")) {
     return custom.trim().replace(/\/+$/, "");
   }
-  return "https://solartechse3-cmyk.github.io/uniquesolarsizing";
+  return "https://solartechse3-cmyk.github.io/uniquesolarsizing1";
 }
 async function autoSyncLicenseToGoogleSheet(lic) {
   try {
@@ -1557,7 +1557,47 @@ VITE_SUPABASE_ANON_KEY=${cfg.anonKey}`;
   res.json({ success: true, config: cfg });
 });
 app.post("/api/publish-update", (req, res) => {
-  const { note } = req.body;
+  const { note, inverters, panels, batteries, mountingDatabase, adminContact, adminResources, appBranding } = req.body;
+  if (inverters && Array.isArray(inverters)) {
+    memoryStorage["inverters"] = inverters;
+    try {
+      const pubDir = import_path.default.join(process.cwd(), "public", "data");
+      const docsDir = import_path.default.join(process.cwd(), "docs", "data");
+      if (!import_fs.default.existsSync(pubDir)) import_fs.default.mkdirSync(pubDir, { recursive: true });
+      if (!import_fs.default.existsSync(docsDir)) import_fs.default.mkdirSync(docsDir, { recursive: true });
+      import_fs.default.writeFileSync(import_path.default.join(pubDir, "inverters.json"), JSON.stringify(inverters, null, 2), "utf-8");
+      import_fs.default.writeFileSync(import_path.default.join(docsDir, "inverters.json"), JSON.stringify(inverters, null, 2), "utf-8");
+    } catch (e) {
+    }
+  }
+  if (panels && Array.isArray(panels)) {
+    memoryStorage["panels"] = panels;
+    try {
+      const pubDir = import_path.default.join(process.cwd(), "public", "data");
+      const docsDir = import_path.default.join(process.cwd(), "docs", "data");
+      if (!import_fs.default.existsSync(pubDir)) import_fs.default.mkdirSync(pubDir, { recursive: true });
+      if (!import_fs.default.existsSync(docsDir)) import_fs.default.mkdirSync(docsDir, { recursive: true });
+      import_fs.default.writeFileSync(import_path.default.join(pubDir, "panels.json"), JSON.stringify(panels, null, 2), "utf-8");
+      import_fs.default.writeFileSync(import_path.default.join(docsDir, "panels.json"), JSON.stringify(panels, null, 2), "utf-8");
+    } catch (e) {
+    }
+  }
+  if (batteries && Array.isArray(batteries)) {
+    memoryStorage["batteries"] = batteries;
+  }
+  if (mountingDatabase) {
+    memoryStorage["mounting_database"] = mountingDatabase;
+  }
+  if (adminContact) {
+    memoryStorage["admin_contact"] = adminContact;
+  }
+  if (adminResources && Array.isArray(adminResources)) {
+    memoryStorage["resources"] = adminResources;
+  }
+  if (appBranding) {
+    memoryStorage["app_branding"] = appBranding;
+  }
+  saveStorageToDisk();
   const publishPayload = {
     publishedAt: (/* @__PURE__ */ new Date()).toISOString(),
     inverters: memoryStorage["inverters"],

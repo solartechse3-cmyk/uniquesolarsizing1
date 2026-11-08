@@ -92,6 +92,34 @@ export const INITIAL_SPEC_REQUESTS: SpecRequest[] = [
 
 let supabaseClient: SupabaseClient | null = null;
 
+// Verified Supabase Cloud Production Credentials for 100% Real-Time Multi-Device Sync on GitHub Pages
+export const DEFAULT_SUPABASE_URL = 'https://vkiwylrerryidoiyqeqh.supabase.co';
+export const DEFAULT_SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZraXd5bHJlcnJ5aWRvaXlxZXFoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODcxNDE3NDMsImV4cCI6MjEwMjcxNzc0M30.skGou_-7bKiDdW4lhfEqkywHzvj3mZT9-N_PTED7Rtc';
+
+/**
+ * Normalizes user-input or environment Supabase URLs.
+ * Handles dashboard URLs like https://supabase.com/dashboard/project/vkiwylrerryidoiyqeqh/...
+ * and bare project IDs like vkiwylrerryidoiyqeqh.
+ */
+export function normalizeSupabaseUrl(rawUrl?: string): string {
+  if (!rawUrl) return '';
+  const cleaned = rawUrl.trim();
+  // Extract project ref from dashboard settings page
+  const dashboardMatch = cleaned.match(/supabase\.com\/dashboard\/project\/([a-z0-9_\-]+)/i);
+  if (dashboardMatch && dashboardMatch[1]) {
+    return `https://${dashboardMatch[1]}.supabase.co`;
+  }
+  // Check if just project id ref
+  if (/^[a-z0-9_\-]{15,30}$/i.test(cleaned)) {
+    return `https://${cleaned}.supabase.co`;
+  }
+  // Strip trailing slashes and ensure https protocol
+  if (cleaned.startsWith('http://') || cleaned.startsWith('https://')) {
+    return cleaned.replace(/\/+$/, '');
+  }
+  return `https://${cleaned}`.replace(/\/+$/, '');
+}
+
 export function getSupabaseCredentials(): { url: string; anonKey: string } {
   let url = '';
   let anonKey = '';
@@ -117,7 +145,18 @@ export function getSupabaseCredentials(): { url: string; anonKey: string } {
     } catch (e) {}
   }
 
-  return { url, anonKey };
+  // Fallback to verified production cloud credentials (critical for static GitHub Pages)
+  if (!url) {
+    url = DEFAULT_SUPABASE_URL;
+  }
+  if (!anonKey) {
+    anonKey = DEFAULT_SUPABASE_ANON_KEY;
+  }
+
+  return { 
+    url: normalizeSupabaseUrl(url), 
+    anonKey: anonKey.trim() 
+  };
 }
 
 export function initSupabase(): SupabaseClient | null {
@@ -132,7 +171,13 @@ export function initSupabase(): SupabaseClient | null {
   }
 
   try {
-    supabaseClient = createClient(url, anonKey);
+    supabaseClient = createClient(url, anonKey, {
+      realtime: {
+        params: {
+          eventsPerSecond: 10
+        }
+      }
+    });
     return supabaseClient;
   } catch (err) {
     console.warn('Supabase initialization failed:', err);
@@ -813,39 +858,23 @@ export async function saveCustomInvertersToCloud(
   }
 
   try {
-    // Save to app_settings (global_custom_inverters & inverters)
-    try {
-      await client
-        .from('app_settings')
-        .upsert({
+    // Save to app_settings (both global_custom_inverters and inverters keys)
+    await client
+      .from('app_settings')
+      .upsert([
+        {
           id: 'global_custom_inverters',
           value: inverters,
           updated_at: new Date().toISOString()
-        }, { onConflict: 'id' });
-    } catch (e) {}
-
-    try {
-      await client
-        .from('app_settings')
-        .upsert({
+        },
+        {
           id: 'inverters',
           value: inverters,
           updated_at: new Date().toISOString()
-        }, { onConflict: 'id' });
-    } catch (e) {}
+        }
+      ], { onConflict: 'id' });
 
-    // Save to solar_app_data table
-    try {
-      await client
-        .from('solar_app_data')
-        .upsert({
-          key: 'inverters',
-          data: inverters,
-          updated_at: new Date().toISOString()
-        }, { onConflict: 'key' });
-    } catch (e) {}
-
-    // Broadcast live event via Supabase Realtime
+    // Broadcast live event via Supabase Realtime so all connected GitHub clients update instantly
     try {
       const liveChannel = client.channel('solar_global_database_events');
       liveChannel.subscribe((status: string) => {
@@ -854,6 +883,11 @@ export async function saveCustomInvertersToCloud(
             type: 'broadcast',
             event: 'inverters_changed',
             payload: { inverters, count: inverters.length, timestamp: Date.now() }
+          });
+          liveChannel.send({
+            type: 'broadcast',
+            event: 'system_published',
+            payload: { inverters, timestamp: Date.now(), note: 'Inverters database updated' }
           });
           setTimeout(() => liveChannel.unsubscribe(), 2000);
         }
@@ -867,10 +901,30 @@ export async function saveCustomInvertersToCloud(
 }
 
 /**
- * Fetch Global Inverter Database from Server / Online Supabase / Static JSON (with Local fallback)
+ * Fetch Global Inverter Database from Online Supabase first, then Server / Local fallback
+ * This ensures GitHub Pages links always receive Admin's live published CSV data
  */
 export async function fetchCustomInvertersFromCloud(): Promise<{ inverters: Inverter[]; source: 'cloud' | 'local' }> {
-  // 1. Try Server API first
+  // 1. Try Supabase Cloud first (Primary single source of truth for GitHub Pages & Web)
+  const client = initSupabase();
+  if (client) {
+    try {
+      const { data, error } = await client
+        .from('app_settings')
+        .select('value')
+        .in('id', ['global_custom_inverters', 'inverters'])
+        .maybeSingle();
+
+      if (!error && data?.value && Array.isArray(data.value) && data.value.length > 0) {
+        try {
+          localStorage.setItem(STORAGE_CUSTOM_INVERTERS_KEY, JSON.stringify(data.value));
+        } catch (e) {}
+        return { inverters: data.value, source: 'cloud' };
+      }
+    } catch (e) {}
+  }
+
+  // 2. Try Server API (for local development or self-hosted backend)
   const serverInverters = await fetchDataFromServer('inverters');
   if (serverInverters && Array.isArray(serverInverters) && serverInverters.length > 0) {
     try {
@@ -879,7 +933,21 @@ export async function fetchCustomInvertersFromCloud(): Promise<{ inverters: Inve
     return { inverters: serverInverters, source: 'cloud' };
   }
 
-  // 2. Try static data file from GitHub Pages or static host
+  // 3. Try LocalStorage cache
+  try {
+    const raw = localStorage.getItem(STORAGE_CUSTOM_INVERTERS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        const isOldDefaultOnly = parsed.some(i => i.id === 'inv_deye_5k_sg04') && !parsed.some(i => i.model?.includes('SUN-6K-SG03') || i.model?.includes('S6EH1P6K'));
+        if (!isOldDefaultOnly) {
+          return { inverters: parsed, source: 'local' };
+        }
+      }
+    }
+  } catch (e) {}
+
+  // 4. Try static data file from GitHub Pages as offline fallback
   try {
     const staticRes = await fetch('./data/inverters.json', { cache: 'no-store' }).catch(() => 
       fetch('/data/inverters.json', { cache: 'no-store' })
@@ -891,55 +959,6 @@ export async function fetchCustomInvertersFromCloud(): Promise<{ inverters: Inve
           localStorage.setItem(STORAGE_CUSTOM_INVERTERS_KEY, JSON.stringify(staticList));
         } catch (e) {}
         return { inverters: staticList, source: 'cloud' };
-      }
-    }
-  } catch (e) {}
-
-  // 3. Try Supabase Cloud
-  const client = initSupabase();
-  if (client) {
-    try {
-      // Check app_settings
-      const { data: d1 } = await client
-        .from('app_settings')
-        .select('value')
-        .in('id', ['global_custom_inverters', 'inverters'])
-        .maybeSingle();
-
-      if (d1?.value && Array.isArray(d1.value) && d1.value.length > 0) {
-        try {
-          localStorage.setItem(STORAGE_CUSTOM_INVERTERS_KEY, JSON.stringify(d1.value));
-        } catch (e) {}
-        return { inverters: d1.value, source: 'cloud' };
-      }
-
-      // Check solar_app_data
-      const { data: d2 } = await client
-        .from('solar_app_data')
-        .select('data')
-        .eq('key', 'inverters')
-        .maybeSingle();
-
-      if (d2?.data && Array.isArray(d2.data) && d2.data.length > 0) {
-        try {
-          localStorage.setItem(STORAGE_CUSTOM_INVERTERS_KEY, JSON.stringify(d2.data));
-        } catch (e) {}
-        return { inverters: d2.data, source: 'cloud' };
-      }
-    } catch (e) {}
-  }
-
-  // 4. Fallback to local storage (sanitizing obsolete cached defaults)
-  try {
-    const raw = localStorage.getItem(STORAGE_CUSTOM_INVERTERS_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        // If it only contains the old single Deye 5kW and not the new 17 models, use DEFAULT_INVERTER_DATABASE
-        const isOldDefaultOnly = parsed.some(i => i.id === 'inv_deye_5k_sg04') && !parsed.some(i => i.model?.includes('SUN-6K-SG03') || i.model?.includes('S6EH1P6K'));
-        if (!isOldDefaultOnly) {
-          return { inverters: parsed, source: 'local' };
-        }
       }
     }
   } catch (e) {}
@@ -983,39 +1002,23 @@ export async function saveCustomPanelsToCloud(
   }
 
   try {
-    // Save to app_settings (global_custom_panels & panels)
-    try {
-      await client
-        .from('app_settings')
-        .upsert({
+    // Save to app_settings (both global_custom_panels and panels keys)
+    await client
+      .from('app_settings')
+      .upsert([
+        {
           id: 'global_custom_panels',
           value: panels,
           updated_at: new Date().toISOString()
-        }, { onConflict: 'id' });
-    } catch (e) {}
-
-    try {
-      await client
-        .from('app_settings')
-        .upsert({
+        },
+        {
           id: 'panels',
           value: panels,
           updated_at: new Date().toISOString()
-        }, { onConflict: 'id' });
-    } catch (e) {}
+        }
+      ], { onConflict: 'id' });
 
-    // Save to solar_app_data table
-    try {
-      await client
-        .from('solar_app_data')
-        .upsert({
-          key: 'panels',
-          data: panels,
-          updated_at: new Date().toISOString()
-        }, { onConflict: 'key' });
-    } catch (e) {}
-
-    // Broadcast live event via Supabase Realtime
+    // Broadcast live event via Supabase Realtime so all connected GitHub clients update instantly
     try {
       const liveChannel = client.channel('solar_global_database_events');
       liveChannel.subscribe((status: string) => {
@@ -1024,6 +1027,11 @@ export async function saveCustomPanelsToCloud(
             type: 'broadcast',
             event: 'panels_changed',
             payload: { panels, count: panels.length, timestamp: Date.now() }
+          });
+          liveChannel.send({
+            type: 'broadcast',
+            event: 'system_published',
+            payload: { panels, timestamp: Date.now(), note: 'Panels database updated' }
           });
           setTimeout(() => liveChannel.unsubscribe(), 2000);
         }
@@ -1037,10 +1045,30 @@ export async function saveCustomPanelsToCloud(
 }
 
 /**
- * Fetch Global Solar Panels Database from Server / Online Supabase / Static JSON (with Local fallback)
+ * Fetch Global Solar Panels Database from Online Supabase first, then Server / Local fallback
+ * This ensures GitHub Pages links always receive Admin's live published CSV data
  */
 export async function fetchCustomPanelsFromCloud(): Promise<{ panels: PanelPreset[]; source: 'cloud' | 'local' }> {
-  // 1. Try Server API first
+  // 1. Try Supabase Cloud first (Primary single source of truth for GitHub Pages & Web)
+  const client = initSupabase();
+  if (client) {
+    try {
+      const { data, error } = await client
+        .from('app_settings')
+        .select('value')
+        .in('id', ['global_custom_panels', 'panels'])
+        .maybeSingle();
+
+      if (!error && data?.value && Array.isArray(data.value) && data.value.length > 0) {
+        try {
+          localStorage.setItem(STORAGE_CUSTOM_PANELS_KEY, JSON.stringify(data.value));
+        } catch (e) {}
+        return { panels: data.value, source: 'cloud' };
+      }
+    } catch (e) {}
+  }
+
+  // 2. Try Server API first
   const serverPanels = await fetchDataFromServer('panels');
   if (serverPanels && Array.isArray(serverPanels) && serverPanels.length > 0) {
     try {
@@ -1049,7 +1077,21 @@ export async function fetchCustomPanelsFromCloud(): Promise<{ panels: PanelPrese
     return { panels: serverPanels, source: 'cloud' };
   }
 
-  // 2. Try static data file from GitHub Pages or static host
+  // 3. Try LocalStorage cache
+  try {
+    const raw = localStorage.getItem(STORAGE_CUSTOM_PANELS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        const isOldDefaultOnly = parsed.some((p: any) => p.id === 'panel_jinko_585_tiger_neo' || p.name?.includes('585W')) && !parsed.some((p: any) => p.name?.includes('615W') || p.name?.includes('SharkTopSun'));
+        if (!isOldDefaultOnly) {
+          return { panels: parsed, source: 'local' };
+        }
+      }
+    }
+  } catch (e) {}
+
+  // 4. Try static data file from GitHub Pages as offline fallback
   try {
     const staticRes = await fetch('./data/panels.json', { cache: 'no-store' }).catch(() => 
       fetch('/data/panels.json', { cache: 'no-store' })
@@ -1061,53 +1103,6 @@ export async function fetchCustomPanelsFromCloud(): Promise<{ panels: PanelPrese
           localStorage.setItem(STORAGE_CUSTOM_PANELS_KEY, JSON.stringify(staticList));
         } catch (e) {}
         return { panels: staticList, source: 'cloud' };
-      }
-    }
-  } catch (e) {}
-
-  // 3. Try Supabase
-  const client = initSupabase();
-  if (client) {
-    try {
-      const { data: d1 } = await client
-        .from('app_settings')
-        .select('value')
-        .in('id', ['global_custom_panels', 'panels'])
-        .maybeSingle();
-
-      if (d1?.value && Array.isArray(d1.value) && d1.value.length > 0) {
-        try {
-          localStorage.setItem(STORAGE_CUSTOM_PANELS_KEY, JSON.stringify(d1.value));
-        } catch (e) {}
-        return { panels: d1.value, source: 'cloud' };
-      }
-
-      const { data: d2 } = await client
-        .from('solar_app_data')
-        .select('data')
-        .eq('key', 'panels')
-        .maybeSingle();
-
-      if (d2?.data && Array.isArray(d2.data) && d2.data.length > 0) {
-        try {
-          localStorage.setItem(STORAGE_CUSTOM_PANELS_KEY, JSON.stringify(d2.data));
-        } catch (e) {}
-        return { panels: d2.data, source: 'cloud' };
-      }
-    } catch (e) {}
-  }
-
-  // 4. Fallback to local storage (sanitizing obsolete cached defaults)
-  try {
-    const raw = localStorage.getItem(STORAGE_CUSTOM_PANELS_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        // If it only contains the old 585W default list and none of the new 5 models, use DEFAULT_PANEL_PRESETS
-        const isOldDefaultOnly = parsed.some((p: any) => p.id === 'panel_jinko_585_tiger_neo' || p.name?.includes('585W')) && !parsed.some((p: any) => p.name?.includes('615W') || p.name?.includes('SharkTopSun'));
-        if (!isOldDefaultOnly) {
-          return { panels: parsed, source: 'local' };
-        }
       }
     }
   } catch (e) {}
@@ -1194,16 +1189,7 @@ export async function saveCustomBatteriesToCloud(
  * Fetch Global Battery Database from Server / Online Supabase (with Local fallback)
  */
 export async function fetchCustomBatteriesFromCloud(): Promise<{ batteries: BatteryPreset[]; source: 'cloud' | 'local' }> {
-  // 1. Try Server API first
-  const serverBatteries = await fetchDataFromServer('batteries');
-  if (serverBatteries && Array.isArray(serverBatteries) && serverBatteries.length > 0) {
-    try {
-      localStorage.setItem(STORAGE_CUSTOM_BATTERIES_KEY, JSON.stringify(serverBatteries));
-    } catch (e) {}
-    return { batteries: serverBatteries, source: 'cloud' };
-  }
-
-  // 2. Try Supabase
+  // 1. Try Supabase Cloud first (Primary for GitHub Pages & Web)
   const client = initSupabase();
   if (client) {
     try {
@@ -1220,6 +1206,15 @@ export async function fetchCustomBatteriesFromCloud(): Promise<{ batteries: Batt
         return { batteries: data.value, source: 'cloud' };
       }
     } catch (e) {}
+  }
+
+  // 2. Try Server API
+  const serverBatteries = await fetchDataFromServer('batteries');
+  if (serverBatteries && Array.isArray(serverBatteries) && serverBatteries.length > 0) {
+    try {
+      localStorage.setItem(STORAGE_CUSTOM_BATTERIES_KEY, JSON.stringify(serverBatteries));
+    } catch (e) {}
+    return { batteries: serverBatteries, source: 'cloud' };
   }
 
   // 3. Fallback to local storage
@@ -1383,6 +1378,42 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
             callbacks.onBatteriesUpdate(payload.payload.batteries);
           }
         })
+        .on('broadcast', { event: 'system_published' }, (payload: any) => {
+          if (isCleanedUp) return;
+          const data = payload?.payload;
+          if (data) {
+            if (data.inverters && Array.isArray(data.inverters) && callbacks.onInvertersUpdate) {
+              try { localStorage.setItem(STORAGE_CUSTOM_INVERTERS_KEY, JSON.stringify(data.inverters)); } catch (e) {}
+              callbacks.onInvertersUpdate(data.inverters);
+            }
+            if (data.panels && Array.isArray(data.panels) && callbacks.onPanelsUpdate) {
+              try { localStorage.setItem(STORAGE_CUSTOM_PANELS_KEY, JSON.stringify(data.panels)); } catch (e) {}
+              callbacks.onPanelsUpdate(data.panels);
+            }
+            if (data.batteries && Array.isArray(data.batteries) && callbacks.onBatteriesUpdate) {
+              try { localStorage.setItem(STORAGE_CUSTOM_BATTERIES_KEY, JSON.stringify(data.batteries)); } catch (e) {}
+              callbacks.onBatteriesUpdate(data.batteries);
+            }
+            if (data.adminContact && callbacks.onAdminContactUpdate) {
+              try { localStorage.setItem(STORAGE_ADMIN_CONTACT_KEY, JSON.stringify(data.adminContact)); } catch (e) {}
+              callbacks.onAdminContactUpdate(data.adminContact);
+            }
+            if (data.appBranding && callbacks.onAppBrandingUpdate) {
+              try { localStorage.setItem(STORAGE_APP_BRANDING_KEY, JSON.stringify(data.appBranding)); } catch (e) {}
+              callbacks.onAppBrandingUpdate(data.appBranding);
+            }
+            if (callbacks.onSystemPublished) {
+              callbacks.onSystemPublished(data);
+            }
+          }
+        })
+        .on('broadcast', { event: 'mounting_database_changed' }, (payload: any) => {
+          if (isCleanedUp) return;
+          const data = payload?.payload;
+          if (data?.mountingDatabase && callbacks.onSystemPublished) {
+            callbacks.onSystemPublished({ timestamp: new Date().toISOString(), mountingDatabase: data.mountingDatabase });
+          }
+        })
         .on('broadcast', { event: 'resources_changed' }, (payload: any) => {
           if (isCleanedUp) return;
           if (payload?.payload?.resources && Array.isArray(payload.payload.resources) && callbacks.onResourcesUpdate) {
@@ -1437,18 +1468,53 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           } else if (rec?.id === 'global_app_branding' && rec?.value && callbacks.onAppBrandingUpdate) {
             try { localStorage.setItem(STORAGE_APP_BRANDING_KEY, JSON.stringify(rec.value)); } catch (e) {}
             callbacks.onAppBrandingUpdate(rec.value);
+          } else if (rec?.id === 'global_admin_contact' && rec?.value && callbacks.onAdminContactUpdate) {
+            try { localStorage.setItem(STORAGE_ADMIN_CONTACT_KEY, JSON.stringify(rec.value)); } catch (e) {}
+            callbacks.onAdminContactUpdate(rec.value);
+          } else if (rec?.id === 'global_mounting_database' && rec?.value && callbacks.onSystemPublished) {
+            callbacks.onSystemPublished({ timestamp: rec.updated_at || new Date().toISOString(), mountingDatabase: rec.value });
           }
         })
         .subscribe();
     } catch (e) {}
   }
 
-  // 4. Periodic Background Polling (every 10 seconds)
-  const pollInterval = setInterval(async () => {
+  // 4. Periodic Cloud Sync Poller (checks Supabase Cloud every 8 seconds - vital for GitHub Pages)
+  const syncSupabaseData = async () => {
     if (isCleanedUp) return;
+    const client = initSupabase();
+    if (client) {
+      try {
+        const { data: rows } = await client
+          .from('app_settings')
+          .select('id, value, updated_at');
+
+        if (Array.isArray(rows) && rows.length > 0 && !isCleanedUp) {
+          rows.forEach((row: any) => {
+            if (row.id === 'global_custom_inverters' && Array.isArray(row.value) && callbacks.onInvertersUpdate) {
+              callbacks.onInvertersUpdate(row.value);
+            } else if (row.id === 'global_custom_panels' && Array.isArray(row.value) && callbacks.onPanelsUpdate) {
+              callbacks.onPanelsUpdate(row.value);
+            } else if (row.id === 'global_custom_batteries' && Array.isArray(row.value) && callbacks.onBatteriesUpdate) {
+              callbacks.onBatteriesUpdate(row.value);
+            } else if (row.id === 'global_admin_resources' && Array.isArray(row.value) && callbacks.onResourcesUpdate) {
+              callbacks.onResourcesUpdate(row.value);
+            } else if (row.id === 'global_admin_contact' && row.value && callbacks.onAdminContactUpdate) {
+              callbacks.onAdminContactUpdate(row.value);
+            } else if (row.id === 'global_app_branding' && row.value && callbacks.onAppBrandingUpdate) {
+              callbacks.onAppBrandingUpdate(row.value);
+            } else if (row.id === 'global_mounting_database' && row.value && callbacks.onSystemPublished) {
+              callbacks.onSystemPublished({ timestamp: row.updated_at || new Date().toISOString(), mountingDatabase: row.value });
+            }
+          });
+        }
+      } catch (err) {}
+    }
+
+    // Also check server if running locally
     try {
       const allData = await fetchAllServerData();
-      if (!isCleanedUp) {
+      if (!isCleanedUp && allData) {
         if (allData.inverters && Array.isArray(allData.inverters) && allData.inverters.length > 0 && callbacks.onInvertersUpdate) {
           callbacks.onInvertersUpdate(allData.inverters);
         }
@@ -1458,25 +1524,30 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
         if (allData.batteries && Array.isArray(allData.batteries) && allData.batteries.length > 0 && callbacks.onBatteriesUpdate) {
           callbacks.onBatteriesUpdate(allData.batteries);
         }
-        if (allData.resources && Array.isArray(allData.resources) && allData.resources.length > 0 && callbacks.onResourcesUpdate) {
-          callbacks.onResourcesUpdate(allData.resources);
-        }
-        if (allData.spec_requests && Array.isArray(allData.spec_requests) && allData.spec_requests.length > 0 && callbacks.onSpecRequestsUpdate) {
-          callbacks.onSpecRequestsUpdate(allData.spec_requests);
-        }
-        if (allData.payment_records && Array.isArray(allData.payment_records) && callbacks.onPaymentRecordsUpdate) {
-          callbacks.onPaymentRecordsUpdate(allData.payment_records);
-        }
-        if (allData.app_branding && callbacks.onAppBrandingUpdate) {
-          callbacks.onAppBrandingUpdate(allData.app_branding);
-        }
       }
     } catch (e) {}
-  }, 10000);
+  };
+
+  const pollInterval = setInterval(syncSupabaseData, 8000);
+
+  // Sync immediately when tab regains focus or becomes visible
+  const handleVisibility = () => {
+    if (typeof document !== 'undefined' && !document.hidden) {
+      syncSupabaseData();
+    }
+  };
+  if (typeof window !== 'undefined') {
+    window.addEventListener('focus', handleVisibility);
+    document.addEventListener('visibilitychange', handleVisibility);
+  }
 
   return () => {
     isCleanedUp = true;
     clearInterval(pollInterval);
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('focus', handleVisibility);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    }
     if (eventSource) {
       try { eventSource.close(); } catch (e) {}
     }
@@ -1760,7 +1831,7 @@ export const DEFAULT_APP_BRANDING: AppBranding = {
   appSubtitle: 'Engineering Suite',
   appVersion: 'v2.5',
   logoUrl: './logo.png',
-  customAppUrl: 'https://solartechse3-cmyk.github.io/uniquesolarsizing'
+  customAppUrl: 'https://solartechse3-cmyk.github.io/uniquesolarsizing1'
 };
 
 /**
@@ -2062,7 +2133,7 @@ export const DEFAULT_ADMIN_CONTACT: AdminContactConfig = {
   viberUrl: "viber://chat?number=09403708145",
   telegramUsername: "uniquesolarpro",
   telegramUrl: "https://t.me/uniquesolarpro",
-  customAppUrl: "https://solartechse3-cmyk.github.io/uniquesolarsizing",
+  customAppUrl: "https://solartechse3-cmyk.github.io/uniquesolarsizing1",
   noteMy: "Viber သို့မဟုတ် Telegram တွင် ဆက်သွယ်၍ 1 Week, 1 Month, 3 Months PRO License Link ရယူနိုင်ပါသည်",
   noteEn: "Contact via Viber or Telegram to purchase 1 Week, 1 Month, 3 Months PRO License Link"
 };
@@ -2520,36 +2591,117 @@ export async function deleteLicenseFromCloud(licenseId: string): Promise<{ succe
   return { success: true };
 }
 
-// Publish Live Update to All Users
-export async function publishLiveSystemUpdate(note?: string): Promise<{ success: boolean; publishedAt?: string }> {
-  // 1. Post to Server SSE broadcaster
+// Publish Live Update to All Users (Direct to Supabase Cloud & Express Server)
+export async function publishLiveSystemUpdate(
+  note?: string,
+  extraPayload?: {
+    inverters?: Inverter[];
+    panels?: PanelPreset[];
+    batteries?: BatteryPreset[];
+    mountingDatabase?: any;
+    adminContact?: AdminContactConfig;
+    adminResources?: AdminResourceFile[];
+    appBranding?: AppBranding;
+  }
+): Promise<{ success: boolean; publishedAt?: string }> {
+  const publishedAt = new Date().toISOString();
+  const publishNote = note || "Admin published live update";
+
+  // 1. Persist ALL equipment datasets to Supabase Cloud so GitHub Pages clients load them immediately
+  const supabase = initSupabase();
+  if (supabase) {
+    try {
+      const upsertRows: Array<{ id: string; value: any; updated_at: string }> = [
+        {
+          id: 'global_system_published',
+          value: { publishedAt, note: publishNote, timestamp: Date.now() },
+          updated_at: publishedAt
+        }
+      ];
+
+      if (extraPayload?.inverters && Array.isArray(extraPayload.inverters)) {
+        upsertRows.push(
+          { id: 'global_custom_inverters', value: extraPayload.inverters, updated_at: publishedAt },
+          { id: 'inverters', value: extraPayload.inverters, updated_at: publishedAt }
+        );
+      }
+      if (extraPayload?.panels && Array.isArray(extraPayload.panels)) {
+        upsertRows.push(
+          { id: 'global_custom_panels', value: extraPayload.panels, updated_at: publishedAt },
+          { id: 'panels', value: extraPayload.panels, updated_at: publishedAt }
+        );
+      }
+      if (extraPayload?.batteries && Array.isArray(extraPayload.batteries)) {
+        upsertRows.push({ id: 'global_custom_batteries', value: extraPayload.batteries, updated_at: publishedAt });
+      }
+      if (extraPayload?.mountingDatabase) {
+        upsertRows.push({ id: 'global_mounting_database', value: extraPayload.mountingDatabase, updated_at: publishedAt });
+      }
+      if (extraPayload?.adminContact) {
+        upsertRows.push({ id: 'global_admin_contact', value: extraPayload.adminContact, updated_at: publishedAt });
+      }
+      if (extraPayload?.appBranding) {
+        upsertRows.push({ id: 'global_app_branding', value: extraPayload.appBranding, updated_at: publishedAt });
+      }
+      if (extraPayload?.adminResources && Array.isArray(extraPayload.adminResources)) {
+        const sanitized = sanitizeResourcesForLocalCache(extraPayload.adminResources);
+        upsertRows.push({ id: 'global_admin_resources', value: sanitized, updated_at: publishedAt });
+      }
+
+      await supabase
+        .from('app_settings')
+        .upsert(upsertRows, { onConflict: 'id' });
+
+      // Broadcast full payload across Supabase Realtime for instant update on all open GitHub tabs
+      const channel = supabase.channel('solar_global_database_events');
+      channel.subscribe((status: string) => {
+        if (status === 'SUBSCRIBED') {
+          channel.send({
+            type: 'broadcast',
+            event: 'system_published',
+            payload: {
+              publishedAt,
+              note: publishNote,
+              timestamp: publishedAt,
+              ...extraPayload
+            }
+          });
+          if (extraPayload?.inverters) {
+            channel.send({
+              type: 'broadcast',
+              event: 'inverters_changed',
+              payload: { inverters: extraPayload.inverters, count: extraPayload.inverters.length, timestamp: Date.now() }
+            });
+          }
+          if (extraPayload?.panels) {
+            channel.send({
+              type: 'broadcast',
+              event: 'panels_changed',
+              payload: { panels: extraPayload.panels, count: extraPayload.panels.length, timestamp: Date.now() }
+            });
+          }
+          setTimeout(() => channel.unsubscribe(), 2500);
+        }
+      });
+    } catch (e) {
+      console.warn('Supabase publish update error:', e);
+    }
+  }
+
+  // 2. Post to Express Server API (if reachable)
   try {
     const res = await fetch('/api/publish-update', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ note: note || "Admin published live update" })
+      body: JSON.stringify({ note: publishNote, ...extraPayload })
     });
     if (res.ok) {
       const json = await res.json();
-      return { success: true, publishedAt: json.publishedAt };
+      return { success: true, publishedAt: json.publishedAt || publishedAt };
     }
   } catch (e) {}
 
-  // 2. Broadcast on Supabase channel if available
-  const supabase = initSupabase();
-  if (supabase) {
-    try {
-      const channel = supabase.channel('solar_system_live_publish');
-      await channel.send({
-        type: 'broadcast',
-        event: 'system_published',
-        payload: { publishedAt: new Date().toISOString(), note }
-      });
-      return { success: true, publishedAt: new Date().toISOString() };
-    } catch (e) {}
-  }
-
-  return { success: true, publishedAt: new Date().toISOString() };
+  return { success: true, publishedAt };
 }
 
 // ----------------------------------------------------

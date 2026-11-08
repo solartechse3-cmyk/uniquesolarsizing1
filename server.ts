@@ -517,7 +517,7 @@ const DEFAULT_INITIAL_ADMIN_CONTACT = {
   viberUrl: "viber://chat?number=09403708145",
   telegramUsername: "uniquesolarpro",
   telegramUrl: "https://t.me/uniquesolarpro",
-  customAppUrl: "https://solartechse3-cmyk.github.io/uniquesolarsizing",
+  customAppUrl: "https://solartechse3-cmyk.github.io/uniquesolarsizing1",
   noteMy: "Viber သို့မဟုတ် Telegram တွင် ဆက်သွယ်၍ 1 Week, 1 Month, 3 Months PRO License Link ရယူနိုင်ပါသည်",
   noteEn: "Contact via Viber or Telegram to purchase 1 Week, 1 Month, 3 Months PRO License Link"
 };
@@ -858,7 +858,7 @@ function getPublicAppUrl(): string {
     return custom.trim().replace(/\/+$/, '');
   }
   // 100% VPN-free GitHub Pages domain for this repository
-  return 'https://solartechse3-cmyk.github.io/uniquesolarsizing';
+  return 'https://solartechse3-cmyk.github.io/uniquesolarsizing1';
 }
 
 async function autoSyncLicenseToGoogleSheet(lic: any) {
@@ -1733,7 +1733,48 @@ app.post("/api/supabase-config", (req, res) => {
 
 // Publish Live System Update to All Active Users
 app.post("/api/publish-update", (req, res) => {
-  const { note } = req.body;
+  const { note, inverters, panels, batteries, mountingDatabase, adminContact, adminResources, appBranding } = req.body;
+
+  if (inverters && Array.isArray(inverters)) {
+    memoryStorage["inverters"] = inverters;
+    try {
+      const pubDir = path.join(process.cwd(), "public", "data");
+      const docsDir = path.join(process.cwd(), "docs", "data");
+      if (!fs.existsSync(pubDir)) fs.mkdirSync(pubDir, { recursive: true });
+      if (!fs.existsSync(docsDir)) fs.mkdirSync(docsDir, { recursive: true });
+      fs.writeFileSync(path.join(pubDir, "inverters.json"), JSON.stringify(inverters, null, 2), "utf-8");
+      fs.writeFileSync(path.join(docsDir, "inverters.json"), JSON.stringify(inverters, null, 2), "utf-8");
+    } catch (e) {}
+  }
+  if (panels && Array.isArray(panels)) {
+    memoryStorage["panels"] = panels;
+    try {
+      const pubDir = path.join(process.cwd(), "public", "data");
+      const docsDir = path.join(process.cwd(), "docs", "data");
+      if (!fs.existsSync(pubDir)) fs.mkdirSync(pubDir, { recursive: true });
+      if (!fs.existsSync(docsDir)) fs.mkdirSync(docsDir, { recursive: true });
+      fs.writeFileSync(path.join(pubDir, "panels.json"), JSON.stringify(panels, null, 2), "utf-8");
+      fs.writeFileSync(path.join(docsDir, "panels.json"), JSON.stringify(panels, null, 2), "utf-8");
+    } catch (e) {}
+  }
+  if (batteries && Array.isArray(batteries)) {
+    memoryStorage["batteries"] = batteries;
+  }
+  if (mountingDatabase) {
+    memoryStorage["mounting_database"] = mountingDatabase;
+  }
+  if (adminContact) {
+    memoryStorage["admin_contact"] = adminContact;
+  }
+  if (adminResources && Array.isArray(adminResources)) {
+    memoryStorage["resources"] = adminResources;
+  }
+  if (appBranding) {
+    memoryStorage["app_branding"] = appBranding;
+  }
+
+  saveStorageToDisk();
+
   const publishPayload = {
     publishedAt: new Date().toISOString(),
     inverters: memoryStorage["inverters"],
