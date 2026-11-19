@@ -522,9 +522,9 @@ export async function publishMountingDatabaseToCloud(
         console.warn('Supabase mounting database save notice:', error.message);
       }
 
-      // Broadcast live event safely via Supabase Realtime without unsubscribing active listeners
+      // Broadcast lightweight live signal via Supabase Realtime so clients pull fresh data immediately
       broadcastCloudEvent('mounting_database_changed', {
-        mountingDatabase: updatedDb,
+        lastUpdated: updatedDb.lastUpdated,
         timestamp: Date.now()
       }).catch(() => {});
     } catch (e) {

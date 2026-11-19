@@ -925,6 +925,8 @@ export default function App() {
   const [activeLicense, setActiveLicense] = useState<LicenseToken | null>(() => getStoredActiveLicense());
   const [allLicenses, setAllLicenses] = useState<LicenseToken[]>([]);
   const [showLicenseModal, setShowLicenseModal] = useState<boolean>(false);
+  const justActivatedAtRef = useRef<number>(0);
+  const autoRebindingTokenRef = useRef<string>('');
 
   const [isPaywallLocked, setIsPaywallLocked] = useState<boolean>(() => {
     try {
@@ -1098,10 +1100,28 @@ export default function App() {
 
     // Reconcile the current device's active PRO license against the live cloud license list
     const reconcileActiveLicenseWithCloud = (licenses: LicenseToken[], notifyChanges: boolean) => {
-      if (!Array.isArray(licenses)) return;
+      if (!Array.isArray(licenses) || licenses.length === 0) return;
       const stored = getStoredActiveLicense();
       const myDeviceId = getMyDeviceId();
-      if (!stored || !stored.token) return;
+      const recentlyActivated = Date.now() - justActivatedAtRef.current < 8000;
+
+      // Auto-restore active PRO license if this device is already bound in Supabase Cloud
+      if (!stored || !stored.token) {
+        const boundActive = licenses.find(l => {
+          if (l.status !== 'active' || new Date(l.expiresAt).getTime() <= Date.now()) return false;
+          const myBound = Array.isArray(l.boundDevices) ? l.boundDevices.find(b => b.deviceId === myDeviceId) : undefined;
+          if (!myBound) return false;
+          const explicitlyUnbound = Array.isArray(l.unboundDeviceIds) && l.unboundDeviceIds.includes(myDeviceId);
+          const unboundAllLater = Boolean(l.unboundAllAt && myBound.activatedAt && new Date(l.unboundAllAt).getTime() > new Date(myBound.activatedAt).getTime());
+          return !explicitlyUnbound && !unboundAllLater;
+        });
+        if (boundActive) {
+          setActiveLicense(boundActive);
+          saveStoredActiveLicense(boundActive);
+          setIsPaywallLocked(false);
+        }
+        return;
+      }
 
       const matched = licenses.find(
         l => l.token.toUpperCase() === stored.token.toUpperCase() || l.id === stored.id
@@ -1132,10 +1152,20 @@ export default function App() {
         const newExpMs = new Date(matched.expiresAt).getTime();
         const wasExtended = newExpMs > prevExpMs + 60000;
 
-        // Check if Admin explicitly unbound this device (only when previously bound on a cloud-issued license)
-        const previouslyBound = Array.isArray(stored.boundDevices) && stored.boundDevices.some(b => b.deviceId === myDeviceId);
+        // ONLY unbind this device if Admin EXPLICITLY clicked Unbind for this device or Unbind All after activation.
+        // Never wipe activeLicense just because a stale snapshot had empty boundDevices.
+        const myStoredBound = Array.isArray(stored.boundDevices)
+          ? stored.boundDevices.find(b => b.deviceId === myDeviceId)
+          : undefined;
         const stillBound = Array.isArray(matched.boundDevices) && matched.boundDevices.some(b => b.deviceId === myDeviceId);
-        if (previouslyBound && !stillBound && !stored.id.startsWith('lic_offline_')) {
+        const explicitlyUnboundThisDevice = Array.isArray(matched.unboundDeviceIds) && matched.unboundDeviceIds.includes(myDeviceId);
+        const explicitlyUnboundAllAfterActivation = Boolean(
+          matched.unboundAllAt &&
+          myStoredBound?.activatedAt &&
+          new Date(matched.unboundAllAt).getTime() > new Date(myStoredBound.activatedAt).getTime()
+        );
+
+        if (!recentlyActivated && !stillBound && (explicitlyUnboundThisDevice || explicitlyUnboundAllAfterActivation) && !stored.id.startsWith('lic_offline_')) {
           setActiveLicense(null);
           saveStoredActiveLicense(null);
           setIsPaywallLocked(true);
@@ -1151,10 +1181,20 @@ export default function App() {
           return;
         }
 
-        // Sync latest cloud license metadata (customerName, expiresAt, deviceLimit, boundDevices)
-        setActiveLicense(matched);
-        saveStoredActiveLicense(matched);
+        // Keep license active and synced with latest cloud metadata (expiresAt, customerName, deviceLimit)
+        const mergedLicense: LicenseToken = (!stillBound && myStoredBound)
+          ? { ...matched, boundDevices: [...(matched.boundDevices || []), myStoredBound] }
+          : matched;
+
+        setActiveLicense(mergedLicense);
+        saveStoredActiveLicense(mergedLicense);
         setIsPaywallLocked(false);
+
+        // If this device's binding was previously cleared by an old publish, silently re-register it to cloud if slot is open
+        if (!recentlyActivated && !stillBound && (matched.boundDevices?.length || 0) < (matched.deviceLimit || 1) && autoRebindingTokenRef.current !== matched.token) {
+          autoRebindingTokenRef.current = matched.token;
+          activateLicenseOnDevice(matched.token).catch(() => {});
+        }
 
         if (notifyChanges && wasExtended) {
           setStatusMsg({
@@ -1165,7 +1205,7 @@ export default function App() {
           });
           setTimeout(() => setStatusMsg(null), 6000);
         }
-      } else if (licenses.length > 0 && !stored.id.startsWith('lic_offline_')) {
+      } else if (!recentlyActivated && licenses.length > 0 && !stored.id.startsWith('lic_offline_')) {
         // Cloud-backed license was deleted by Admin
         setActiveLicense(null);
         saveStoredActiveLicense(null);
@@ -1180,58 +1220,59 @@ export default function App() {
       }
     };
 
-    // Fast single batch fetch from Express backend server ONLY when backend is reachable (returns null on GitHub Pages)
-    // NOTE: Never overwrite Supabase Cloud with stale localStorage here!
-    fetchAllServerData().then(allData => {
-      if (!isMounted || !allData) return;
-      if (allData.inverters && Array.isArray(allData.inverters) && allData.inverters.length > 0) {
-        setCustomInverters(allData.inverters);
-      }
-      if (allData.panels && Array.isArray(allData.panels) && allData.panels.length > 0) {
-        setCustomPanels(ensureUniquePanelIds(allData.panels));
-      }
-      if (allData.batteries && Array.isArray(allData.batteries) && allData.batteries.length > 0) {
-        setCustomBatteries(allData.batteries);
-      }
-      if (allData.resources && Array.isArray(allData.resources) && allData.resources.length > 0) {
-        setAdminResources(allData.resources);
-      }
-      if (allData.spec_requests && Array.isArray(allData.spec_requests) && allData.spec_requests.length > 0) {
-        setSpecRequests(allData.spec_requests);
-      }
-      if (allData.mounting_database && typeof allData.mounting_database === 'object' && Array.isArray(allData.mounting_database.panels)) {
-        setMountingDatabase(allData.mounting_database);
-      }
-      if (allData.payment_config && typeof allData.payment_config === 'object' && Array.isArray(allData.payment_config.accounts)) {
-        setPaymentConfig(allData.payment_config);
-      }
-      if (allData.app_branding && typeof allData.app_branding === 'object') {
-        setAppBranding(allData.app_branding);
-      }
-      if (allData.admin_contact && typeof allData.admin_contact === 'object') {
-        setAdminContact(allData.admin_contact);
-      }
-      if (allData.licenses && Array.isArray(allData.licenses)) {
-        setAllLicenses(allData.licenses);
-        reconcileActiveLicenseWithCloud(allData.licenses, false);
-      }
-      if (allData.payment_records && Array.isArray(allData.payment_records)) {
-        setPaymentRecords(allData.payment_records);
-        const mySessionId = getMySessionId();
-        const matched = allData.payment_records.find(r => 
-          (r.sessionId && r.sessionId === mySessionId) ||
-          (currentPaymentRecord && r.id === currentPaymentRecord.id) ||
-          (currentPaymentRecord && r.transactionDigits === currentPaymentRecord.transactionDigits)
-        );
-        if (matched) {
-          setCurrentPaymentRecord(matched);
-          if (matched.status === 'approved') {
-            setIsPaywallLocked(false);
-            setShowLicenseModal(false);
+    // Only pull from Express backend when Supabase Cloud is NOT connected (prevents stale local app_storage.json from overwriting fresh Supabase Cloud data)
+    if (!isSupabaseConnected()) {
+      fetchAllServerData().then(allData => {
+        if (!isMounted || !allData) return;
+        if (allData.inverters && Array.isArray(allData.inverters) && allData.inverters.length > 0) {
+          setCustomInverters(allData.inverters);
+        }
+        if (allData.panels && Array.isArray(allData.panels) && allData.panels.length > 0) {
+          setCustomPanels(ensureUniquePanelIds(allData.panels));
+        }
+        if (allData.batteries && Array.isArray(allData.batteries) && allData.batteries.length > 0) {
+          setCustomBatteries(allData.batteries);
+        }
+        if (allData.resources && Array.isArray(allData.resources) && allData.resources.length > 0) {
+          setAdminResources(allData.resources);
+        }
+        if (allData.spec_requests && Array.isArray(allData.spec_requests) && allData.spec_requests.length > 0) {
+          setSpecRequests(allData.spec_requests);
+        }
+        if (allData.mounting_database && typeof allData.mounting_database === 'object' && Array.isArray(allData.mounting_database.panels)) {
+          setMountingDatabase(allData.mounting_database);
+        }
+        if (allData.payment_config && typeof allData.payment_config === 'object' && Array.isArray(allData.payment_config.accounts)) {
+          setPaymentConfig(allData.payment_config);
+        }
+        if (allData.app_branding && typeof allData.app_branding === 'object') {
+          setAppBranding(allData.app_branding);
+        }
+        if (allData.admin_contact && typeof allData.admin_contact === 'object') {
+          setAdminContact(allData.admin_contact);
+        }
+        if (allData.licenses && Array.isArray(allData.licenses)) {
+          setAllLicenses(allData.licenses);
+          reconcileActiveLicenseWithCloud(allData.licenses, false);
+        }
+        if (allData.payment_records && Array.isArray(allData.payment_records)) {
+          setPaymentRecords(allData.payment_records);
+          const mySessionId = getMySessionId();
+          const matched = allData.payment_records.find(r => 
+            (r.sessionId && r.sessionId === mySessionId) ||
+            (currentPaymentRecord && r.id === currentPaymentRecord.id) ||
+            (currentPaymentRecord && r.transactionDigits === currentPaymentRecord.transactionDigits)
+          );
+          if (matched) {
+            setCurrentPaymentRecord(matched);
+            if (matched.status === 'approved') {
+              setIsPaywallLocked(false);
+              setShowLicenseModal(false);
+            }
           }
         }
-      }
-    }).catch(() => {});
+      }).catch(() => {});
+    }
 
     // Fetch payment config from Supabase Cloud
     fetchPaymentConfigFromCloud(paymentConfig).then(res => {
@@ -1330,9 +1371,13 @@ export default function App() {
       const urlLicense = searchParams.get('license');
       if (urlLicense && urlLicense.trim()) {
         const cleanToken = urlLicense.trim();
+        justActivatedAtRef.current = Date.now();
         activateLicenseOnDevice(cleanToken).then(res => {
           if (res.success && res.license) {
+            justActivatedAtRef.current = Date.now();
             setActiveLicense(res.license);
+            saveStoredActiveLicense(res.license);
+            setAllLicenses(prev => [res.license!, ...prev.filter(l => l.token.toUpperCase() !== res.license!.token.toUpperCase())]);
             setIsPaywallLocked(false);
             setShowLicenseModal(false);
             try {
@@ -1447,10 +1492,6 @@ export default function App() {
         if (payload.mountingDatabase) setMountingDatabase(payload.mountingDatabase);
         if (payload.adminContact) setAdminContact(payload.adminContact);
         if (payload.appBranding) setAppBranding(payload.appBranding);
-        if (payload.licenses && Array.isArray(payload.licenses)) {
-          setAllLicenses(payload.licenses);
-          reconcileActiveLicenseWithCloud(payload.licenses, true);
-        }
         setStatusMsg({
           text: lang === 'my' 
             ? '🚀 Admin မှ ဖိုင်များနှင့် Database အသစ်များကို Online Update လုပ်လိုက်ပါပြီ! (Live Synced)' 
@@ -1990,9 +2031,13 @@ export default function App() {
 
   // License Activation & Management Handlers
   const handleActivateLicense = async (token: string): Promise<{ success: boolean; message?: string }> => {
+    justActivatedAtRef.current = Date.now();
     const res = await activateLicenseOnDevice(token);
     if (res.success && res.license) {
+      justActivatedAtRef.current = Date.now();
       setActiveLicense(res.license);
+      saveStoredActiveLicense(res.license);
+      setAllLicenses(prev => [res.license!, ...prev.filter(l => l.token.toUpperCase() !== res.license!.token.toUpperCase())]);
       setIsPaywallLocked(false);
       try {
         appendLicenseRecordToSheet(res.license, window.location.origin).catch(() => {});
@@ -2006,7 +2051,7 @@ export default function App() {
       setTimeout(() => setStatusMsg(null), 5000);
       return { success: true };
     }
-    return { success: false, message: res.error || 'Activation failed' };
+    return { success: false, message: res.message || res.error || 'Activation failed' };
   };
 
   const handleDeactivateLicense = () => {
@@ -2074,7 +2119,6 @@ export default function App() {
       adminContact: adminContact,
       adminResources: adminResources,
       appBranding: appBranding,
-      licenses: allLicenses,
       paymentConfig: paymentConfig
     });
     return res;

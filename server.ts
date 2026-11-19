@@ -120,7 +120,7 @@ async function broadcastSupabaseEvent(event: string, payload: Record<string, any
       body: JSON.stringify({
         messages: [
           {
-            topic: "realtime:solar_global_database_events",
+            topic: "solar_global_database_events",
             event,
             payload
           }
@@ -137,7 +137,7 @@ async function syncLicensesToSupabase(licenses: any[]): Promise<void> {
     { id: "global_licenses", value: safeList, updated_at: new Date().toISOString() }
   ]);
   await broadcastSupabaseEvent("licenses_changed", {
-    licenses: safeList,
+    count: safeList.length,
     timestamp: Date.now()
   });
 }
@@ -199,6 +199,107 @@ async function pullAndMergeLicensesFromSupabase(): Promise<any[]> {
     syncLicensesToSupabase(merged).catch(() => {});
   }
   return merged;
+}
+
+async function syncAllDataFromSupabaseOnStartup(): Promise<void> {
+  try {
+    const { url, anonKey } = getSupabaseRestConfig();
+    if (!url || !anonKey) return;
+    const ids = [
+      "global_custom_inverters",
+      "global_custom_panels",
+      "global_custom_batteries",
+      "global_admin_resources",
+      "global_spec_requests",
+      "global_payment_config",
+      "global_payment_records",
+      "global_app_branding",
+      "global_admin_contact",
+      "global_mounting_database"
+    ];
+    const inParam = `(${ids.map(id => `"${id}"`).join(",")})`;
+    const res = await fetch(
+      `${url}/rest/v1/app_settings?id=in.${encodeURIComponent(inParam)}&select=id,value,updated_at`,
+      {
+        headers: {
+          apikey: anonKey,
+          Authorization: `Bearer ${anonKey}`,
+          "Cache-Control": "no-cache"
+        },
+        signal: AbortSignal.timeout(8000)
+      }
+    );
+    if (!res.ok) return;
+    const rows: any = await res.json();
+    if (!Array.isArray(rows) || rows.length === 0) return;
+
+    const map: Record<string, any> = {};
+    for (const r of rows) {
+      if (r && r.id) map[r.id] = r.value;
+    }
+
+    let changed = false;
+    const writeStaticJson = (filename: string, data: any) => {
+      try {
+        const pubDir = path.join(process.cwd(), "public", "data");
+        const docsDir = path.join(process.cwd(), "docs", "data");
+        if (!fs.existsSync(pubDir)) fs.mkdirSync(pubDir, { recursive: true });
+        if (!fs.existsSync(docsDir)) fs.mkdirSync(docsDir, { recursive: true });
+        fs.writeFileSync(path.join(pubDir, filename), JSON.stringify(data, null, 2), "utf-8");
+        fs.writeFileSync(path.join(docsDir, filename), JSON.stringify(data, null, 2), "utf-8");
+      } catch (e) {}
+    };
+
+    if (Array.isArray(map["global_custom_inverters"]) && map["global_custom_inverters"].length > 0) {
+      memoryStorage["inverters"] = map["global_custom_inverters"];
+      writeStaticJson("inverters.json", map["global_custom_inverters"]);
+      changed = true;
+    }
+    if (Array.isArray(map["global_custom_panels"]) && map["global_custom_panels"].length > 0) {
+      memoryStorage["panels"] = map["global_custom_panels"];
+      writeStaticJson("panels.json", map["global_custom_panels"]);
+      changed = true;
+    }
+    if (Array.isArray(map["global_custom_batteries"]) && map["global_custom_batteries"].length > 0) {
+      memoryStorage["batteries"] = map["global_custom_batteries"];
+      changed = true;
+    }
+    if (Array.isArray(map["global_admin_resources"])) {
+      memoryStorage["resources"] = map["global_admin_resources"];
+      changed = true;
+    }
+    if (Array.isArray(map["global_spec_requests"]) && map["global_spec_requests"].length > 0) {
+      memoryStorage["spec_requests"] = map["global_spec_requests"];
+      changed = true;
+    }
+    if (map["global_payment_config"] && typeof map["global_payment_config"] === "object") {
+      memoryStorage["payment_config"] = map["global_payment_config"];
+      changed = true;
+    }
+    if (Array.isArray(map["global_payment_records"])) {
+      memoryStorage["payment_records"] = map["global_payment_records"];
+      changed = true;
+    }
+    if (map["global_app_branding"] && typeof map["global_app_branding"] === "object") {
+      memoryStorage["app_branding"] = map["global_app_branding"];
+      changed = true;
+    }
+    if (map["global_admin_contact"] && typeof map["global_admin_contact"] === "object") {
+      memoryStorage["admin_contact"] = map["global_admin_contact"];
+      changed = true;
+    }
+    if (map["global_mounting_database"] && typeof map["global_mounting_database"] === "object") {
+      memoryStorage["mounting_database"] = map["global_mounting_database"];
+      changed = true;
+    }
+
+    if (changed) {
+      saveStorageToDisk();
+    }
+    await pullAndMergeLicensesFromSupabase();
+  } catch (err: any) {
+    console.warn("Startup Supabase sync notice:", err?.message || err);
+  }
 }
 
 // ----------------------------------------------------
@@ -1191,6 +1292,9 @@ app.post("/api/license/activate", async (req, res) => {
     if (existingDevice) {
       existingDevice.lastSeenAt = new Date().toISOString();
       existingDevice.deviceModel = safeDeviceModel;
+      if (Array.isArray(lic.unboundDeviceIds)) {
+        lic.unboundDeviceIds = lic.unboundDeviceIds.filter((id: string) => id !== safeDeviceId);
+      }
       saveStorageToDisk();
       broadcastSSE("licenses", memoryStorage["licenses"]);
       syncLicensesToSupabase(memoryStorage["licenses"]).catch(() => {});
@@ -1216,6 +1320,9 @@ app.post("/api/license/activate", async (req, res) => {
       lastSeenAt: new Date().toISOString()
     });
     lic.boundDevices = bound;
+    if (Array.isArray(lic.unboundDeviceIds)) {
+      lic.unboundDeviceIds = lic.unboundDeviceIds.filter((id: string) => id !== safeDeviceId);
+    }
     saveStorageToDisk();
     broadcastSSE("licenses", memoryStorage["licenses"]);
     syncLicensesToSupabase(memoryStorage["licenses"]).catch(() => {});
@@ -1253,8 +1360,11 @@ app.post("/api/license/unbind-device", async (req, res) => {
 
   if (!deviceId || deviceId === 'all') {
     lic.boundDevices = [];
+    lic.unboundAllAt = new Date().toISOString();
   } else {
     lic.boundDevices = (lic.boundDevices || []).filter((d: any) => d.deviceId !== deviceId);
+    const prevUnbound = Array.isArray(lic.unboundDeviceIds) ? lic.unboundDeviceIds : [];
+    lic.unboundDeviceIds = Array.from(new Set([...prevUnbound, deviceId]));
   }
 
   memoryStorage["licenses"] = list;
@@ -2228,9 +2338,7 @@ app.post("/api/publish-update", async (req, res) => {
   if (appBranding) {
     memoryStorage["app_branding"] = appBranding;
   }
-  if (licenses && Array.isArray(licenses)) {
-    memoryStorage["licenses"] = licenses;
-  }
+  // IMPORTANT: Never overwrite `licenses` during Publish Live Update so active user boundDevices are never wiped
   if (paymentConfig) {
     memoryStorage["payment_config"] = paymentConfig;
   }
@@ -2247,7 +2355,6 @@ app.post("/api/publish-update", async (req, res) => {
     mounting_database: memoryStorage["mounting_database"],
     admin_contact: memoryStorage["admin_contact"] || DEFAULT_INITIAL_ADMIN_CONTACT,
     app_branding: memoryStorage["app_branding"],
-    licenses: memoryStorage["licenses"],
     payment_config: memoryStorage["payment_config"],
     note: note || "Admin published live update"
   };
@@ -2287,9 +2394,6 @@ app.post("/api/publish-update", async (req, res) => {
   }
   if (memoryStorage["payment_config"]) {
     cloudRows.push({ id: "global_payment_config", value: memoryStorage["payment_config"], updated_at: publishedAt });
-  }
-  if (Array.isArray(memoryStorage["licenses"])) {
-    cloudRows.push({ id: "global_licenses", value: memoryStorage["licenses"], updated_at: publishedAt });
   }
   if (Array.isArray(memoryStorage["resources"])) {
     const lightResources = memoryStorage["resources"].map((r: any) => {
@@ -2416,7 +2520,7 @@ app.post("/api/upload-resource", (req, res) => {
         return meta;
       });
       await upsertSupabaseAppSettings([{ id: "global_admin_resources", value: lightResources }]);
-      await broadcastSupabaseEvent("resources_changed", { resources: lightResources, timestamp: Date.now() });
+      await broadcastSupabaseEvent("resources_changed", { count: lightResources.length, timestamp: Date.now() });
     })().catch(() => {});
 
     return res.json({ success: true, resource: newResource, count: memoryStorage["resources"].length });
@@ -2476,31 +2580,31 @@ app.post("/api/data/:key", (req, res) => {
         { id: "global_custom_inverters", value: data, updated_at: nowIso },
         { id: "inverters", value: data, updated_at: nowIso }
       ]);
-      await broadcastSupabaseEvent("inverters_changed", { inverters: data, timestamp: Date.now() });
+      await broadcastSupabaseEvent("inverters_changed", { count: Array.isArray(data) ? data.length : 0, timestamp: Date.now() });
     } else if (key === "panels") {
       await upsertSupabaseAppSettings([
         { id: "global_custom_panels", value: data, updated_at: nowIso },
         { id: "panels", value: data, updated_at: nowIso }
       ]);
-      await broadcastSupabaseEvent("panels_changed", { panels: data, timestamp: Date.now() });
+      await broadcastSupabaseEvent("panels_changed", { count: Array.isArray(data) ? data.length : 0, timestamp: Date.now() });
     } else if (key === "batteries") {
       await upsertSupabaseAppSettings([{ id: "global_custom_batteries", value: data, updated_at: nowIso }]);
-      await broadcastSupabaseEvent("batteries_changed", { batteries: data, timestamp: Date.now() });
+      await broadcastSupabaseEvent("batteries_changed", { count: Array.isArray(data) ? data.length : 0, timestamp: Date.now() });
     } else if (key === "mounting_database") {
       await upsertSupabaseAppSettings([{ id: "global_mounting_database", value: data, updated_at: nowIso }]);
-      await broadcastSupabaseEvent("mounting_database_changed", { database: data, timestamp: Date.now() });
+      await broadcastSupabaseEvent("mounting_database_changed", { timestamp: Date.now() });
     } else if (key === "app_branding") {
       await upsertSupabaseAppSettings([{ id: "global_app_branding", value: data, updated_at: nowIso }]);
-      await broadcastSupabaseEvent("app_branding_changed", { branding: data, timestamp: Date.now() });
+      await broadcastSupabaseEvent("app_branding_changed", { timestamp: Date.now() });
     } else if (key === "payment_config") {
       await upsertSupabaseAppSettings([{ id: "global_payment_config", value: data, updated_at: nowIso }]);
-      await broadcastSupabaseEvent("payment_config_changed", { config: data, timestamp: Date.now() });
+      await broadcastSupabaseEvent("payment_config_changed", { timestamp: Date.now() });
     } else if (key === "payment_records") {
       await upsertSupabaseAppSettings([{ id: "global_payment_records", value: data, updated_at: nowIso }]);
-      await broadcastSupabaseEvent("payment_records_changed", { records: data, timestamp: Date.now() });
+      await broadcastSupabaseEvent("payment_records_changed", { timestamp: Date.now() });
     } else if (key === "spec_requests") {
       await upsertSupabaseAppSettings([{ id: "global_spec_requests", value: data, updated_at: nowIso }]);
-      await broadcastSupabaseEvent("spec_requests_changed", { requests: data, timestamp: Date.now() });
+      await broadcastSupabaseEvent("spec_requests_changed", { timestamp: Date.now() });
     } else if (key === "resources" && Array.isArray(data)) {
       const lightResources = data.map((r: any) => {
         if (r.fileData && String(r.fileData).startsWith("data:")) {
@@ -2515,7 +2619,7 @@ app.post("/api/data/:key", (req, res) => {
         return r;
       });
       await upsertSupabaseAppSettings([{ id: "global_admin_resources", value: lightResources, updated_at: nowIso }]);
-      await broadcastSupabaseEvent("resources_changed", { resources: lightResources, timestamp: Date.now() });
+      await broadcastSupabaseEvent("resources_changed", { count: lightResources.length, timestamp: Date.now() });
     } else if (key === "licenses") {
       await syncLicensesToSupabase(data);
     } else if (key === "admin_contact") {
@@ -2523,7 +2627,7 @@ app.post("/api/data/:key", (req, res) => {
         { id: "global_admin_contact", value: data, updated_at: nowIso },
         { id: "admin_contact_config", value: data, updated_at: nowIso }
       ]);
-      await broadcastSupabaseEvent("admin_contact_changed", { contact: data, timestamp: Date.now() });
+      await broadcastSupabaseEvent("admin_contact_changed", { timestamp: Date.now() });
     }
   })().catch(() => {});
 
@@ -2591,7 +2695,7 @@ async function startServer() {
 
   app.listen(PORT, HOST, () => {
     console.log(`Solar Sizer Server running on http://${HOST}:${PORT}`);
-    pullAndMergeLicensesFromSupabase().catch(() => {});
+    syncAllDataFromSupabaseOnStartup().catch(() => {});
     startTelegramPolling();
   });
 }

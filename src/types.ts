@@ -96,6 +96,8 @@ export interface LicenseToken {
   expiresAt: string;
   status: 'active' | 'expired' | 'revoked';
   note?: string;
+  unboundDeviceIds?: string[];
+  unboundAllAt?: string;
 }
 
 export interface DurationPackage {

@@ -172,6 +172,10 @@ export function initSupabase(): SupabaseClient | null {
 
   try {
     supabaseClient = createClient(url, anonKey, {
+      global: {
+        fetch: (input: RequestInfo | URL, init?: RequestInit) =>
+          fetch(input, { ...init, cache: 'no-store' })
+      },
       realtime: {
         params: {
           eventsPerSecond: 10
@@ -217,7 +221,7 @@ export async function broadcastCloudEvent(event: string, payload: Record<string,
       body: JSON.stringify({
         messages: [
           {
-            topic: 'realtime:solar_global_database_events',
+            topic: 'solar_global_database_events',
             event,
             payload
           }
@@ -920,8 +924,8 @@ export async function saveCustomInvertersToCloud(
       console.warn('Supabase inverters upsert notice:', error.message);
     }
 
-    // Broadcast live event via Supabase Realtime so all connected GitHub clients update instantly
-    broadcastCloudEvent('inverters_changed', { inverters, count: inverters.length, timestamp: Date.now() }).catch(() => {});
+    // Broadcast lightweight live signal via Supabase Realtime so all connected GitHub clients pull fresh data instantly
+    broadcastCloudEvent('inverters_changed', { count: inverters.length, timestamp: Date.now() }).catch(() => {});
 
     return { success: !error, source: 'cloud', count: inverters.length, error: error?.message };
   } catch (err: any) {
@@ -1062,8 +1066,8 @@ export async function saveCustomPanelsToCloud(
       console.warn('Supabase panels upsert notice:', error.message);
     }
 
-    // Broadcast live event via Supabase Realtime so all connected GitHub clients update instantly
-    broadcastCloudEvent('panels_changed', { panels, count: panels.length, timestamp: Date.now() }).catch(() => {});
+    // Broadcast lightweight live signal via Supabase Realtime so all connected GitHub clients pull fresh data instantly
+    broadcastCloudEvent('panels_changed', { count: panels.length, timestamp: Date.now() }).catch(() => {});
 
     return { success: !error, source: 'cloud', count: panels.length, error: error?.message };
   } catch (err: any) {
@@ -1203,7 +1207,7 @@ export async function saveCustomBatteriesToCloud(
       return { success: false, source: 'local', count: batteries.length, error: error.message };
     }
 
-    broadcastCloudEvent('batteries_changed', { batteries, count: batteries.length, timestamp: Date.now() }).catch(() => {});
+    broadcastCloudEvent('batteries_changed', { count: batteries.length, timestamp: Date.now() }).catch(() => {});
 
     return { success: true, source: 'cloud', count: batteries.length };
   } catch (err: any) {
@@ -1358,12 +1362,31 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
   let supabaseChannel: any = null;
   let eventSource: EventSource | null = null;
   const lastSeenUpdatedAt: Record<string, string> = {};
+  let lastPublishedToastStamp = '';
   let hasCompletedInitialPoll = false;
 
-  const applySettingRow = (id: string, value: any, updatedAt?: string, isInitialHydration: boolean = false) => {
+  const triggerPublishToastOnce = (stamp: string, note?: string, extra?: Record<string, any>) => {
+    if (!callbacks.onSystemPublished) return;
+    const key = stamp || '';
+    if (key && lastPublishedToastStamp === key) return;
+    if (key) lastPublishedToastStamp = key;
+    callbacks.onSystemPublished({
+      timestamp: stamp || new Date().toISOString(),
+      note: note || 'Admin published a live update',
+      ...(extra || {})
+    });
+  };
+
+  const applySettingRow = (
+    id: string,
+    value: any,
+    updatedAt?: string,
+    isInitialHydration: boolean = false,
+    forceApply: boolean = false
+  ) => {
     if (isCleanedUp || value === undefined || value === null) return;
     const stamp = updatedAt || '';
-    if (!isInitialHydration && stamp && lastSeenUpdatedAt[id] === stamp) {
+    if (!isInitialHydration && !forceApply && stamp && lastSeenUpdatedAt[id] === stamp) {
       return;
     }
     if (stamp) {
@@ -1405,11 +1428,50 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
     } else if (id === 'global_licenses' && Array.isArray(value) && callbacks.onLicensesUpdate) {
       try { localStorage.setItem(STORAGE_ALL_LICENSES_KEY, JSON.stringify(value)); } catch (e) {}
       callbacks.onLicensesUpdate(value);
-    } else if (id === 'global_system_published' && !isInitialHydration && callbacks.onSystemPublished) {
-      callbacks.onSystemPublished({
-        timestamp: value?.publishedAt || updatedAt || new Date().toISOString(),
-        note: value?.note || 'Admin published a live update'
-      });
+    } else if (id === 'global_system_published') {
+      const pubStamp = value?.publishedAt || updatedAt || '';
+      if (isInitialHydration) {
+        if (pubStamp) lastPublishedToastStamp = pubStamp;
+      } else {
+        triggerPublishToastOnce(pubStamp, value?.note);
+      }
+    }
+  };
+
+  // Smart Cloud Sync Puller (used by initial load, 3s poller, AND triggered instantly on every Realtime Broadcast)
+  let syncInFlight: Promise<void> | null = null;
+  const syncSupabaseData = async (forceApply: boolean = false) => {
+    if (isCleanedUp) return;
+    if (syncInFlight && !forceApply) return syncInFlight;
+    const run = (async () => {
+      const map = await syncAllDataNowFromCloud();
+      if (map && !isCleanedUp) {
+        const isInitial = !hasCompletedInitialPoll;
+        // Apply all datasets before global_system_published so state is already fresh when publish toast triggers
+        for (const key of GLOBAL_SYNC_SETTING_IDS) {
+          if (key === 'global_system_published') continue;
+          const entry = map[key];
+          if (entry) {
+            applySettingRow(key, entry.value, entry.updated_at, isInitial, forceApply);
+          }
+        }
+        if (map['global_system_published']) {
+          applySettingRow(
+            'global_system_published',
+            map['global_system_published'].value,
+            map['global_system_published'].updated_at,
+            isInitial,
+            forceApply
+          );
+        }
+        hasCompletedInitialPoll = true;
+      }
+    })();
+    syncInFlight = run;
+    try {
+      await run;
+    } finally {
+      if (syncInFlight === run) syncInFlight = null;
     }
   };
 
@@ -1453,8 +1515,8 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
             callbacks.onAdminContactUpdate(data);
           } else if (type === 'mounting_database' && data && callbacks.onMountingDatabaseUpdate) {
             callbacks.onMountingDatabaseUpdate(data);
-          } else if (type === 'system_published' && data && callbacks.onSystemPublished) {
-            callbacks.onSystemPublished(data);
+          } else if (type === 'system_published' && data) {
+            triggerPublishToastOnce(data.publishedAt || data.timestamp || '', data.note, data);
           }
         } catch (e) {}
       };
@@ -1505,6 +1567,8 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           if (payload?.payload?.inverters && Array.isArray(payload.payload.inverters) && callbacks.onInvertersUpdate) {
             try { localStorage.setItem(STORAGE_CUSTOM_INVERTERS_KEY, JSON.stringify(payload.payload.inverters)); } catch (e) {}
             callbacks.onInvertersUpdate(payload.payload.inverters);
+          } else {
+            syncSupabaseData(true);
           }
         })
         .on('broadcast', { event: 'panels_changed' }, (payload: any) => {
@@ -1512,6 +1576,8 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           if (payload?.payload?.panels && Array.isArray(payload.payload.panels) && callbacks.onPanelsUpdate) {
             try { localStorage.setItem(STORAGE_CUSTOM_PANELS_KEY, JSON.stringify(payload.payload.panels)); } catch (e) {}
             callbacks.onPanelsUpdate(payload.payload.panels);
+          } else {
+            syncSupabaseData(true);
           }
         })
         .on('broadcast', { event: 'batteries_changed' }, (payload: any) => {
@@ -1519,6 +1585,8 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           if (payload?.payload?.batteries && Array.isArray(payload.payload.batteries) && callbacks.onBatteriesUpdate) {
             try { localStorage.setItem(STORAGE_CUSTOM_BATTERIES_KEY, JSON.stringify(payload.payload.batteries)); } catch (e) {}
             callbacks.onBatteriesUpdate(payload.payload.batteries);
+          } else {
+            syncSupabaseData(true);
           }
         })
         .on('broadcast', { event: 'licenses_changed' }, (payload: any) => {
@@ -1526,6 +1594,8 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           if (payload?.payload?.licenses && Array.isArray(payload.payload.licenses) && callbacks.onLicensesUpdate) {
             try { localStorage.setItem(STORAGE_ALL_LICENSES_KEY, JSON.stringify(payload.payload.licenses)); } catch (e) {}
             callbacks.onLicensesUpdate(payload.payload.licenses);
+          } else {
+            syncSupabaseData(true);
           }
         })
         .on('broadcast', { event: 'admin_contact_changed' }, (payload: any) => {
@@ -1533,6 +1603,8 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           if (payload?.payload?.contact && callbacks.onAdminContactUpdate) {
             try { localStorage.setItem(STORAGE_ADMIN_CONTACT_KEY, JSON.stringify(payload.payload.contact)); } catch (e) {}
             callbacks.onAdminContactUpdate(payload.payload.contact);
+          } else {
+            syncSupabaseData(true);
           }
         })
         .on('broadcast', { event: 'payment_config_changed' }, (payload: any) => {
@@ -1540,57 +1612,28 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           if (payload?.payload?.config && callbacks.onPaymentConfigUpdate) {
             try { localStorage.setItem(STORAGE_PAYMENT_CONFIG_KEY, JSON.stringify(payload.payload.config)); } catch (e) {}
             callbacks.onPaymentConfigUpdate(payload.payload.config);
+          } else {
+            syncSupabaseData(true);
           }
         })
         .on('broadcast', { event: 'system_published' }, (payload: any) => {
           if (isCleanedUp) return;
-          const data = payload?.payload;
-          if (data) {
-            if (data.inverters && Array.isArray(data.inverters) && callbacks.onInvertersUpdate) {
-              try { localStorage.setItem(STORAGE_CUSTOM_INVERTERS_KEY, JSON.stringify(data.inverters)); } catch (e) {}
-              callbacks.onInvertersUpdate(data.inverters);
+          const data = payload?.payload || {};
+          // Pull fresh authoritative rows from Supabase REST API immediately, then show publish toast
+          syncSupabaseData(true).then(() => {
+            if (!isCleanedUp) {
+              triggerPublishToastOnce(data.publishedAt || data.timestamp || new Date().toISOString(), data.note);
             }
-            if (data.panels && Array.isArray(data.panels) && callbacks.onPanelsUpdate) {
-              try { localStorage.setItem(STORAGE_CUSTOM_PANELS_KEY, JSON.stringify(data.panels)); } catch (e) {}
-              callbacks.onPanelsUpdate(data.panels);
-            }
-            if (data.batteries && Array.isArray(data.batteries) && callbacks.onBatteriesUpdate) {
-              try { localStorage.setItem(STORAGE_CUSTOM_BATTERIES_KEY, JSON.stringify(data.batteries)); } catch (e) {}
-              callbacks.onBatteriesUpdate(data.batteries);
-            }
-            if (data.adminResources && Array.isArray(data.adminResources) && callbacks.onResourcesUpdate) {
-              try { localStorage.setItem(STORAGE_ADMIN_RESOURCES_KEY, JSON.stringify(sanitizeResourcesForLocalCache(data.adminResources))); } catch (e) {}
-              callbacks.onResourcesUpdate(data.adminResources);
-            }
-            if (data.mountingDatabase && callbacks.onMountingDatabaseUpdate) {
-              try { localStorage.setItem('solar_mounting_database_v1', JSON.stringify(data.mountingDatabase)); } catch (e) {}
-              callbacks.onMountingDatabaseUpdate(data.mountingDatabase);
-            }
-            if (data.adminContact && callbacks.onAdminContactUpdate) {
-              try { localStorage.setItem(STORAGE_ADMIN_CONTACT_KEY, JSON.stringify(data.adminContact)); } catch (e) {}
-              callbacks.onAdminContactUpdate(data.adminContact);
-            }
-            if (data.appBranding && callbacks.onAppBrandingUpdate) {
-              try { localStorage.setItem(STORAGE_APP_BRANDING_KEY, JSON.stringify(data.appBranding)); } catch (e) {}
-              callbacks.onAppBrandingUpdate(data.appBranding);
-            }
-            if (data.licenses && Array.isArray(data.licenses) && callbacks.onLicensesUpdate) {
-              try { localStorage.setItem(STORAGE_ALL_LICENSES_KEY, JSON.stringify(data.licenses)); } catch (e) {}
-              callbacks.onLicensesUpdate(data.licenses);
-            }
-            if (callbacks.onSystemPublished) {
-              callbacks.onSystemPublished(data);
-            }
-          }
+          });
         })
         .on('broadcast', { event: 'mounting_database_changed' }, (payload: any) => {
           if (isCleanedUp) return;
           const data = payload?.payload;
-          if (data?.mountingDatabase) {
+          if (data?.mountingDatabase && callbacks.onMountingDatabaseUpdate) {
             try { localStorage.setItem('solar_mounting_database_v1', JSON.stringify(data.mountingDatabase)); } catch (e) {}
-            if (callbacks.onMountingDatabaseUpdate) {
-              callbacks.onMountingDatabaseUpdate(data.mountingDatabase);
-            }
+            callbacks.onMountingDatabaseUpdate(data.mountingDatabase);
+          } else {
+            syncSupabaseData(true);
           }
         })
         .on('broadcast', { event: 'resources_changed' }, (payload: any) => {
@@ -1598,6 +1641,8 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           if (payload?.payload?.resources && Array.isArray(payload.payload.resources) && callbacks.onResourcesUpdate) {
             try { localStorage.setItem(STORAGE_ADMIN_RESOURCES_KEY, JSON.stringify(sanitizeResourcesForLocalCache(payload.payload.resources))); } catch (e) {}
             callbacks.onResourcesUpdate(payload.payload.resources);
+          } else {
+            syncSupabaseData(true);
           }
         })
         .on('broadcast', { event: 'spec_requests_changed' }, (payload: any) => {
@@ -1605,6 +1650,8 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           if (payload?.payload?.requests && Array.isArray(payload.payload.requests) && callbacks.onSpecRequestsUpdate) {
             try { localStorage.setItem(STORAGE_SPEC_REQUESTS_KEY, JSON.stringify(payload.payload.requests)); } catch (e) {}
             callbacks.onSpecRequestsUpdate(payload.payload.requests);
+          } else {
+            syncSupabaseData(true);
           }
         })
         .on('broadcast', { event: 'payment_records_changed' }, (payload: any) => {
@@ -1612,6 +1659,8 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           if (payload?.payload?.records && Array.isArray(payload.payload.records) && callbacks.onPaymentRecordsUpdate) {
             try { localStorage.setItem(STORAGE_PAYMENT_RECORDS_KEY, JSON.stringify(payload.payload.records)); } catch (e) {}
             callbacks.onPaymentRecordsUpdate(payload.payload.records);
+          } else {
+            syncSupabaseData(true);
           }
         })
         .on('broadcast', { event: 'app_branding_changed' }, (payload: any) => {
@@ -1619,13 +1668,15 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           if (payload?.payload?.branding && callbacks.onAppBrandingUpdate) {
             try { localStorage.setItem(STORAGE_APP_BRANDING_KEY, JSON.stringify(payload.payload.branding)); } catch (e) {}
             callbacks.onAppBrandingUpdate(payload.payload.branding);
+          } else {
+            syncSupabaseData(true);
           }
         })
         .on('postgres_changes', { event: '*', schema: 'public', table: 'app_settings' }, (payload: any) => {
           if (isCleanedUp) return;
           const rec = payload.new;
           if (rec?.id && GLOBAL_SYNC_SETTING_IDS.includes(rec.id)) {
-            applySettingRow(rec.id, rec.value, rec.updated_at, false);
+            applySettingRow(rec.id, rec.value, rec.updated_at, false, true);
           }
         })
         .subscribe((status: string) => {
@@ -1634,36 +1685,12 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
     } catch (e) {}
   }
 
-  // 4. Smart Periodic Cloud Sync Poller (every 5 seconds - guarantees real-time sync on GitHub Pages even behind strict Myanmar mobile networks)
-  const syncSupabaseData = async () => {
-    if (isCleanedUp) return;
-    const map = await syncAllDataNowFromCloud();
-    if (map && !isCleanedUp) {
-      const isInitial = !hasCompletedInitialPoll;
-      // Apply all datasets before global_system_published so state is already fresh when publish toast triggers
-      for (const key of GLOBAL_SYNC_SETTING_IDS) {
-        if (key === 'global_system_published') continue;
-        const entry = map[key];
-        if (entry) {
-          applySettingRow(key, entry.value, entry.updated_at, isInitial);
-        }
-      }
-      if (map['global_system_published']) {
-        applySettingRow(
-          'global_system_published',
-          map['global_system_published'].value,
-          map['global_system_published'].updated_at,
-          isInitial
-        );
-      }
-      hasCompletedInitialPoll = true;
-    }
-  };
-
-  // Run an immediate initial cloud poll right away so all datasets & licenses hydrate in 1 fast call
+  // 4. Smart Periodic Cloud Sync Poller (every 3 seconds - guarantees real-time sync on GitHub Pages even behind strict Myanmar mobile networks)
   syncSupabaseData();
 
-  const pollInterval = setInterval(syncSupabaseData, 5000);
+  const pollInterval = setInterval(() => {
+    syncSupabaseData(false);
+  }, 3000);
 
   // Sync immediately when tab regains focus, becomes visible, or network reconnects
   const handleVisibility = () => {
@@ -1860,7 +1887,7 @@ export async function saveAdminResourcesToCloud(
       return { success: false, source: 'local', count: resources.length, error: error.message };
     }
 
-    broadcastCloudEvent('resources_changed', { resources: sanitized, count: resources.length, timestamp: Date.now() }).catch(() => {});
+    broadcastCloudEvent('resources_changed', { count: resources.length, timestamp: Date.now() }).catch(() => {});
 
     return { success: true, source: 'cloud', count: resources.length };
   } catch (err: any) {
@@ -2075,7 +2102,7 @@ export async function saveAppBrandingToCloud(
       return { success: false, source: 'local', error: error.message };
     }
 
-    broadcastCloudEvent('app_branding_changed', { branding, timestamp: Date.now() }).catch(() => {});
+    broadcastCloudEvent('app_branding_changed', { timestamp: Date.now() }).catch(() => {});
 
     return { success: true, source: 'cloud' };
   } catch (err: any) {
@@ -2516,7 +2543,7 @@ export async function saveLicensesToCloud(licenses: LicenseToken[]): Promise<{ s
         return { success: false, error: error.message };
       }
 
-      broadcastCloudEvent('licenses_changed', { licenses, timestamp: Date.now() }).catch(() => {});
+      broadcastCloudEvent('licenses_changed', { count: licenses.length, timestamp: Date.now() }).catch(() => {});
       return { success: true };
     } catch (e: any) {
       return { success: false, error: e?.message };
@@ -2651,6 +2678,9 @@ export async function activateLicenseOnDevice(token: string): Promise<{
               lastSeenAt: new Date().toISOString()
             };
             lic.boundDevices = bound;
+            if (Array.isArray(lic.unboundDeviceIds)) {
+              lic.unboundDeviceIds = lic.unboundDeviceIds.filter(id => id !== deviceId);
+            }
             list[licIndex] = lic;
             await saveLicensesToCloud(list);
             saveStoredActiveLicense(lic);
@@ -2672,6 +2702,9 @@ export async function activateLicenseOnDevice(token: string): Promise<{
             lastSeenAt: new Date().toISOString()
           });
           lic.boundDevices = bound;
+          if (Array.isArray(lic.unboundDeviceIds)) {
+            lic.unboundDeviceIds = lic.unboundDeviceIds.filter(id => id !== deviceId);
+          }
           list[licIndex] = lic;
           await saveLicensesToCloud(list);
           saveStoredActiveLicense(lic);
@@ -2809,8 +2842,11 @@ export async function unbindLicenseDevice(licenseId: string, deviceId?: string):
   if (lic) {
     if (!deviceId || deviceId === 'all') {
       lic.boundDevices = [];
+      lic.unboundAllAt = new Date().toISOString();
     } else {
       lic.boundDevices = (lic.boundDevices || []).filter(b => b.deviceId !== deviceId);
+      const prevUnbound = Array.isArray(lic.unboundDeviceIds) ? lic.unboundDeviceIds : [];
+      lic.unboundDeviceIds = Array.from(new Set([...prevUnbound, deviceId]));
     }
     await saveLicensesToCloud(licenses);
     return { success: true, license: lic };
@@ -2931,9 +2967,8 @@ export async function publishLiveSystemUpdate(
       if (extraPayload?.paymentConfig) {
         upsertRows.push({ id: 'global_payment_config', value: extraPayload.paymentConfig, updated_at: publishedAt });
       }
-      if (extraPayload?.licenses && Array.isArray(extraPayload.licenses)) {
-        upsertRows.push({ id: 'global_licenses', value: extraPayload.licenses, updated_at: publishedAt });
-      }
+      // IMPORTANT: NEVER overwrite `global_licenses` during Publish Live Update!
+      // Licenses have their own live cloud sync (generate/activate/extend/unbind/revoke) so user boundDevices are never wiped.
       if (extraPayload?.adminResources && Array.isArray(extraPayload.adminResources)) {
         // Upload any inline binary file data to dedicated `resource_file_<id>` rows first
         for (const res of extraPayload.adminResources) {
@@ -2967,29 +3002,25 @@ export async function publishLiveSystemUpdate(
         console.warn('Supabase publish update error:', error.message);
       }
 
-      // Broadcast sanitized payload across Supabase Realtime for instant update on all open GitHub tabs
-      const sanitizedPayload = {
+      // Broadcast lightweight live signal via Supabase Realtime so all connected GitHub clients pull fresh data in <300ms
+      broadcastCloudEvent('system_published', {
         publishedAt,
         note: publishNote,
-        timestamp: publishedAt,
-        ...extraPayload,
-        adminResources: extraPayload?.adminResources
-          ? sanitizeResourcesForLocalCache(extraPayload.adminResources)
-          : undefined
-      };
-      broadcastCloudEvent('system_published', sanitizedPayload).catch(() => {});
+        timestamp: Date.now()
+      }).catch(() => {});
     } catch (e: any) {
       cloudError = e?.message;
       console.warn('Supabase publish update error:', e);
     }
   }
 
-  // 2. Post to Express Server API (if reachable)
+  // 2. Post to Express Server API (if reachable) — omit licenses so server never overwrites global_licenses
   try {
+    const { licenses: _omitLicenses, ...safeServerPayload } = extraPayload || {};
     const res = await fetch('/api/publish-update', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ note: publishNote, ...extraPayload })
+      body: JSON.stringify({ note: publishNote, ...safeServerPayload })
     });
     if (res.ok) {
       const contentType = res.headers.get('content-type') || '';
