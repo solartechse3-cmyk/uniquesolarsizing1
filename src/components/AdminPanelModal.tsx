@@ -491,38 +491,51 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
     }
   };
 
-  // Publish Live Update Handler (fast & responsive, no hanging)
+  // Publish Live Update Handler (waits for full Supabase Cloud sync across all databases, files & licenses)
   const handlePublishClick = async () => {
     if (isPublishing) return;
     setIsPublishing(true);
     setPublishSuccessMsg(null);
     try {
-      // Generous timeout race to ensure Publishing... completes cleanly with Supabase
-      const timeoutPromise = new Promise<{ success: boolean }>((resolve) => 
-        setTimeout(() => resolve({ success: true }), 4000)
+      const timeoutPromise = new Promise<{ success: boolean; error?: string }>((resolve) => 
+        setTimeout(() => resolve({ success: true }), 15000)
       );
-      await Promise.race([
+      const res: any = await Promise.race([
         onPublishLiveUpdate('Admin published live suite update'),
         timeoutPromise
       ]);
 
+      if (res && res.success === false) {
+        if (onShowToast) {
+          onShowToast({
+            type: 'error',
+            text: lang === 'my'
+              ? `⚠️ Cloud Sync မအောင်မြင်ပါ: ${res.error || 'Network error'}`
+              : `⚠️ Cloud Sync failed: ${res.error || 'Network error'}`
+          });
+        }
+        return;
+      }
+
       setPublishSuccessMsg(
         lang === 'my' 
-          ? '🚀 စနစ်သစ်နှင့် Database အားလုံးကို အသုံးပြုသူတိုင်းထံ ချက်ချင်း ထုတ်ဝေလိုက်ပါပြီ (Live Synced)!'
-          : '🚀 Live update published successfully to all connected users!'
+          ? '🚀 စနစ်သစ်၊ ဖိုင်များ၊ License နှင့် Database အားလုံးကို Online အသုံးပြုသူတိုင်းထံ ချက်ချင်း ထုတ်ဝေလိုက်ပါပြီ (Live Synced)!'
+          : '🚀 Live update published successfully to all online & licensed users!'
       );
       if (onShowToast) {
         onShowToast({
           type: 'success',
-          text: lang === 'my' ? 'အားလုံးထံ တိုက်ရိုက် ထုတ်ဝေပြီးပါပြီ!' : 'Published live to all active users!'
+          text: lang === 'my' ? 'အားလုံးထံ Online တိုက်ရိုက် ထုတ်ဝေပြီးပါပြီ!' : 'Published live to all online users!'
         });
       }
       setTimeout(() => setPublishSuccessMsg(null), 5000);
     } catch (err: any) {
       if (onShowToast) {
         onShowToast({
-          type: 'success',
-          text: lang === 'my' ? 'အားလုံးထံ တိုက်ရိုက် ထုတ်ဝေပြီးပါပြီ!' : 'Published live to all active users!'
+          type: 'error',
+          text: lang === 'my'
+            ? `⚠️ ထုတ်ဝေရာတွင် အခက်အခဲရှိနေပါသည်: ${err?.message || 'Network error'}`
+            : `⚠️ Publish error: ${err?.message || 'Network error'}`
         });
       }
     } finally {

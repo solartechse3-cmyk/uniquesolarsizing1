@@ -192,6 +192,7 @@ export interface AdminResourceFile {
   fileType: string;
   fileData?: string; // base64 or data URL
   fileUrl?: string; // direct server download URL
+  hasCloudFile?: boolean; // true when binary fileData is stored in Supabase app_settings
   uploadedAt: string;
   uploadedBy: string;
   isPaidOnly: boolean;

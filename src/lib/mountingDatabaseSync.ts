@@ -1,7 +1,7 @@
 import * as XLSX from 'xlsx';
 import { MountingDatabase, MountingPanelItem, RoofComponentItem, GroundComponentItem } from '../types';
 import { INITIAL_MOUNTING_DATABASE } from '../data/mountingDatabaseDefaults';
-import { initSupabase } from './supabase';
+import { initSupabase, broadcastCloudEvent } from './supabase';
 
 const STORAGE_MOUNTING_DB_KEY = 'solar_mounting_database_v1';
 
@@ -510,7 +510,7 @@ export async function publishMountingDatabaseToCloud(
   const client = initSupabase();
   if (client) {
     try {
-      await client
+      const { error } = await client
         .from('app_settings')
         .upsert({
           id: 'global_mounting_database',
@@ -518,23 +518,15 @@ export async function publishMountingDatabaseToCloud(
           updated_at: updatedDb.lastUpdated
         }, { onConflict: 'id' });
 
-      // Broadcast live event via Supabase Realtime
-      const liveChannel = client.channel('solar_global_database_events');
-      liveChannel.subscribe((status: string) => {
-        if (status === 'SUBSCRIBED') {
-          liveChannel.send({
-            type: 'broadcast',
-            event: 'mounting_database_changed',
-            payload: { mountingDatabase: updatedDb, timestamp: Date.now() }
-          });
-          liveChannel.send({
-            type: 'broadcast',
-            event: 'system_published',
-            payload: { mountingDatabase: updatedDb, timestamp: Date.now(), note: 'Mounting database published' }
-          });
-          setTimeout(() => liveChannel.unsubscribe(), 2000);
-        }
-      });
+      if (error) {
+        console.warn('Supabase mounting database save notice:', error.message);
+      }
+
+      // Broadcast live event safely via Supabase Realtime without unsubscribing active listeners
+      broadcastCloudEvent('mounting_database_changed', {
+        mountingDatabase: updatedDb,
+        timestamp: Date.now()
+      }).catch(() => {});
     } catch (e) {
       console.warn('Supabase mounting database save notice:', e);
     }

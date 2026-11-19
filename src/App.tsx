@@ -101,6 +101,7 @@ import {
   fetchCustomBatteriesFromCloud,
   saveAdminResourcesToCloud,
   fetchAdminResourcesFromCloud,
+  deleteResourceFileFromCloud,
   sanitizeResourcesForLocalCache,
   saveSpecRequestsToCloud,
   fetchSpecRequestsFromCloud,
@@ -736,6 +737,12 @@ export default function App() {
       localStorage.setItem('solar_sizer_custom_batteries_v1', JSON.stringify(batteries));
     } catch (e) {}
     await saveCustomBatteriesToCloud(batteries);
+    publishLiveSystemUpdate('Batteries database updated', {
+      inverters: customInverters,
+      panels: customPanels,
+      batteries,
+      mountingDatabase
+    }).catch(() => {});
   };
 
   // Active Selection states
@@ -1085,62 +1092,107 @@ export default function App() {
     };
   });
 
-  // Initial server & cloud fetch for Payment Config, Site Surveys, Load Calculations, Inverters, Panels, Resources, Payment Records & Realtime Sync
+  // Initial server & cloud fetch for Payment Config, Inverters, Panels, Batteries, Resources, Mounting DB, Licenses & Realtime Sync
   useEffect(() => {
     let isMounted = true;
-    
-    // Fast single batch fetch from Express backend server
-    fetchAllServerData().then(async allData => {
+
+    // Reconcile the current device's active PRO license against the live cloud license list
+    const reconcileActiveLicenseWithCloud = (licenses: LicenseToken[], notifyChanges: boolean) => {
+      if (!Array.isArray(licenses)) return;
+      const stored = getStoredActiveLicense();
+      const myDeviceId = getMyDeviceId();
+      if (!stored || !stored.token) return;
+
+      const matched = licenses.find(
+        l => l.token.toUpperCase() === stored.token.toUpperCase() || l.id === stored.id
+      );
+
+      if (matched) {
+        const isExpired = matched.status === 'expired' || new Date(matched.expiresAt).getTime() <= Date.now();
+        const isRevoked = matched.status !== 'active';
+
+        if (isRevoked || isExpired) {
+          setActiveLicense(isExpired ? { ...matched, status: 'expired' } : null);
+          saveStoredActiveLicense(null);
+          setIsPaywallLocked(true);
+          if (notifyChanges) {
+            setStatusMsg({
+              text: isExpired
+                ? (lang === 'my' ? '⚠️ သင့် PRO လိုင်စင် သက်တမ်းကုန်ဆုံးသွားပါပြီ။ Admin ထံ ဆက်သွယ်၍ သက်တမ်းတိုးနိုင်ပါသည်။' : '⚠️ Your PRO license has expired.')
+                : (lang === 'my' ? '⚠️ သင့် PRO လိုင်စင်ကို Admin မှ ပိတ်သိမ်းလိုက်ပါသည်' : '⚠️ Your license has been revoked by Admin'),
+              type: 'error'
+            });
+            setTimeout(() => setStatusMsg(null), 6000);
+          }
+          return;
+        }
+
+        // Check if Admin extended expiration date
+        const prevExpMs = new Date(stored.expiresAt).getTime();
+        const newExpMs = new Date(matched.expiresAt).getTime();
+        const wasExtended = newExpMs > prevExpMs + 60000;
+
+        // Check if Admin explicitly unbound this device (only when previously bound on a cloud-issued license)
+        const previouslyBound = Array.isArray(stored.boundDevices) && stored.boundDevices.some(b => b.deviceId === myDeviceId);
+        const stillBound = Array.isArray(matched.boundDevices) && matched.boundDevices.some(b => b.deviceId === myDeviceId);
+        if (previouslyBound && !stillBound && !stored.id.startsWith('lic_offline_')) {
+          setActiveLicense(null);
+          saveStoredActiveLicense(null);
+          setIsPaywallLocked(true);
+          if (notifyChanges) {
+            setStatusMsg({
+              text: lang === 'my'
+                ? '⚠️ ဤစက်အား Admin မှ လိုင်စင်ချိတ်ဆက်မှု ဖြုတ်လိုက်ပါသည် (Device Unbound)'
+                : '⚠️ This device was unbound by Admin. Please re-activate your license.',
+              type: 'error'
+            });
+            setTimeout(() => setStatusMsg(null), 6000);
+          }
+          return;
+        }
+
+        // Sync latest cloud license metadata (customerName, expiresAt, deviceLimit, boundDevices)
+        setActiveLicense(matched);
+        saveStoredActiveLicense(matched);
+        setIsPaywallLocked(false);
+
+        if (notifyChanges && wasExtended) {
+          setStatusMsg({
+            text: lang === 'my'
+              ? `🎉 Admin မှ သင့် PRO လိုင်စင် သက်တမ်းကို ${new Date(matched.expiresAt).toLocaleDateString()} အထိ တိုးပေးလိုက်ပါပြီ!`
+              : `🎉 Admin extended your PRO license until ${new Date(matched.expiresAt).toLocaleDateString()}!`,
+            type: 'success'
+          });
+          setTimeout(() => setStatusMsg(null), 6000);
+        }
+      } else if (licenses.length > 0 && !stored.id.startsWith('lic_offline_')) {
+        // Cloud-backed license was deleted by Admin
+        setActiveLicense(null);
+        saveStoredActiveLicense(null);
+        setIsPaywallLocked(true);
+        if (notifyChanges) {
+          setStatusMsg({
+            text: lang === 'my' ? '⚠️ သင့် PRO လိုင်စင်ကို Admin မှ ဖျက်သိမ်းလိုက်ပါသည်' : '⚠️ Your license was removed by Admin',
+            type: 'error'
+          });
+          setTimeout(() => setStatusMsg(null), 6000);
+        }
+      }
+    };
+
+    // Fast single batch fetch from Express backend server ONLY when backend is reachable (returns null on GitHub Pages)
+    // NOTE: Never overwrite Supabase Cloud with stale localStorage here!
+    fetchAllServerData().then(allData => {
       if (!isMounted || !allData) return;
       if (allData.inverters && Array.isArray(allData.inverters) && allData.inverters.length > 0) {
         setCustomInverters(allData.inverters);
-      } else {
-        // Self-heal: If server is empty/fresh after publishing, push local storage to server
-        try {
-          const localInv = localStorage.getItem('solar_sizer_custom_inverters_v3');
-          if (localInv) {
-            const parsed = JSON.parse(localInv);
-            if (Array.isArray(parsed) && parsed.length > 0) {
-              setCustomInverters(parsed);
-              saveCustomInvertersToCloud(parsed);
-            }
-          }
-        } catch (e) {}
       }
-
       if (allData.panels && Array.isArray(allData.panels) && allData.panels.length > 0) {
         setCustomPanels(ensureUniquePanelIds(allData.panels));
-      } else {
-        // Self-heal panels
-        try {
-          const localPnl = localStorage.getItem('solar_sizer_custom_panels_v3');
-          if (localPnl) {
-            const parsed = JSON.parse(localPnl);
-            if (Array.isArray(parsed) && parsed.length > 0) {
-              const sanitized = ensureUniquePanelIds(parsed);
-              setCustomPanels(sanitized);
-              saveCustomPanelsToCloud(sanitized);
-            }
-          }
-        } catch (e) {}
       }
-
       if (allData.batteries && Array.isArray(allData.batteries) && allData.batteries.length > 0) {
         setCustomBatteries(allData.batteries);
-      } else {
-        // Self-heal batteries
-        try {
-          const localBat = localStorage.getItem('solar_sizer_custom_batteries_v1');
-          if (localBat) {
-            const parsed = JSON.parse(localBat);
-            if (Array.isArray(parsed) && parsed.length > 0) {
-              setCustomBatteries(parsed);
-              saveCustomBatteriesToCloud(parsed);
-            }
-          }
-        } catch (e) {}
       }
-
       if (allData.resources && Array.isArray(allData.resources) && allData.resources.length > 0) {
         setAdminResources(allData.resources);
       }
@@ -1152,36 +1204,17 @@ export default function App() {
       }
       if (allData.payment_config && typeof allData.payment_config === 'object' && Array.isArray(allData.payment_config.accounts)) {
         setPaymentConfig(allData.payment_config);
-      } else {
-        // Self-heal payment config
-        try {
-          const localPay = localStorage.getItem('solar_sizer_payment_config_v3');
-          if (localPay) {
-            const parsed = JSON.parse(localPay);
-            if (parsed && Array.isArray(parsed.accounts) && parsed.accounts.length > 0) {
-              setPaymentConfig(parsed);
-              savePaymentConfigToCloud(parsed);
-            }
-          }
-        } catch (e) {}
       }
-
       if (allData.app_branding && typeof allData.app_branding === 'object') {
         setAppBranding(allData.app_branding);
-      } else {
-        // Self-heal app branding
-        try {
-          const localBrand = localStorage.getItem('solar_sizer_app_branding_v1');
-          if (localBrand) {
-            const parsed = JSON.parse(localBrand);
-            if (parsed && typeof parsed === 'object') {
-              setAppBranding(parsed);
-              saveAppBrandingToCloud(parsed);
-            }
-          }
-        } catch (e) {}
       }
-
+      if (allData.admin_contact && typeof allData.admin_contact === 'object') {
+        setAdminContact(allData.admin_contact);
+      }
+      if (allData.licenses && Array.isArray(allData.licenses)) {
+        setAllLicenses(allData.licenses);
+        reconcileActiveLicenseWithCloud(allData.licenses, false);
+      }
       if (allData.payment_records && Array.isArray(allData.payment_records)) {
         setPaymentRecords(allData.payment_records);
         const mySessionId = getMySessionId();
@@ -1200,14 +1233,14 @@ export default function App() {
       }
     }).catch(() => {});
 
-    // Fetch payment config from cloud
+    // Fetch payment config from Supabase Cloud
     fetchPaymentConfigFromCloud(paymentConfig).then(res => {
       if (isMounted && res && res.config && Array.isArray(res.config.accounts)) {
         setPaymentConfig(res.config);
       }
     }).catch(() => {});
 
-    // Fetch payment records from cloud
+    // Fetch payment records from Supabase Cloud
     fetchPaymentRecordsFromCloud().then(payRes => {
       if (isMounted && payRes && Array.isArray(payRes.records)) {
         setPaymentRecords(payRes.records);
@@ -1227,66 +1260,67 @@ export default function App() {
       }
     }).catch(() => {});
 
-    // Fetch inverters from cloud (so all users have access to admin-uploaded CSV)
+    // Fetch inverters from Supabase Cloud (so all GitHub Pages & PRO users immediately see Admin's latest CSV)
     fetchCustomInvertersFromCloud().then(invRes => {
       if (isMounted && invRes && Array.isArray(invRes.inverters) && invRes.inverters.length > 0) {
         setCustomInverters(invRes.inverters);
       }
     }).catch(() => {});
 
-    // Fetch solar panels from cloud (so all users have access to admin-uploaded CSV)
+    // Fetch solar panels from Supabase Cloud
     fetchCustomPanelsFromCloud().then(pnlRes => {
       if (isMounted && pnlRes && Array.isArray(pnlRes.panels) && pnlRes.panels.length > 0) {
         setCustomPanels(ensureUniquePanelIds(pnlRes.panels));
       }
     }).catch(() => {});
 
-    // Fetch batteries from cloud (so all users have access to admin-uploaded database)
+    // Fetch batteries from Supabase Cloud
     fetchCustomBatteriesFromCloud().then(batRes => {
       if (isMounted && batRes && Array.isArray(batRes.batteries) && batRes.batteries.length > 0) {
         setCustomBatteries(batRes.batteries);
       }
     }).catch(() => {});
 
-    // Fetch admin resource files from cloud (so all users have access to admin-uploaded datasheets, diagrams, guides, etc.)
+    // Fetch admin resource files from Supabase Cloud
     fetchAdminResourcesFromCloud().then(resRes => {
-      if (isMounted && resRes && Array.isArray(resRes.resources) && resRes.resources.length > 0) {
+      if (isMounted && resRes && Array.isArray(resRes.resources)) {
         setAdminResources(resRes.resources);
       }
     }).catch(() => {});
 
-    // Fetch spec requests from cloud
+    // Fetch spec requests from Supabase Cloud
     fetchSpecRequestsFromCloud().then(specRes => {
       if (isMounted && specRes && Array.isArray(specRes.requests) && specRes.requests.length > 0) {
         setSpecRequests(specRes.requests);
       }
     }).catch(() => {});
 
-    // Fetch app branding & logo from cloud (so all users have the latest admin-set logo instantly)
+    // Fetch app branding & logo from Supabase Cloud
     fetchAppBrandingFromCloud().then(brandRes => {
       if (isMounted && brandRes && brandRes.branding) {
         setAppBranding(brandRes.branding);
       }
     }).catch(() => {});
 
-    // Fetch mounting database from server / cloud
+    // Fetch mounting database from Supabase Cloud
     fetchMountingDatabaseFromCloud().then(mountRes => {
       if (isMounted && mountRes && mountRes.db && Array.isArray(mountRes.db.panels) && mountRes.db.panels.length > 0) {
         setMountingDatabase(mountRes.db);
       }
     }).catch(() => {});
 
-    // Fetch Admin Contact (Viber / Telegram)
+    // Fetch Admin Contact (Viber / Telegram) from Supabase Cloud
     fetchAdminContactFromCloud().then(contactRes => {
       if (isMounted && contactRes) {
         setAdminContact(contactRes);
       }
     }).catch(() => {});
 
-    // Fetch Licenses
+    // Fetch Licenses from Supabase Cloud & reconcile active license immediately
     fetchLicensesFromCloud().then(licRes => {
       if (isMounted && Array.isArray(licRes)) {
         setAllLicenses(licRes);
+        reconcileActiveLicenseWithCloud(licRes, true);
       }
     }).catch(() => {});
 
@@ -1313,7 +1347,7 @@ export default function App() {
             setTimeout(() => setStatusMsg(null), 5000);
           } else {
             setStatusMsg({
-              text: res.error || (lang === 'my' ? '⚠️ လိုင်စင်ကုဒ် မှားယွင်းနေပါသည် သို့မဟုတ် စက်အရေအတွက် ပြည့်သွားပါပြီ' : '⚠️ Invalid license or device limit reached'),
+              text: res.message || res.error || (lang === 'my' ? '⚠️ လိုင်စင်ကုဒ် မှားယွင်းနေပါသည် သို့မဟုတ် စက်အရေအတွက် ပြည့်သွားပါပြီ' : '⚠️ Invalid license or device limit reached'),
               type: 'error'
             });
             setTimeout(() => setStatusMsg(null), 6000);
@@ -1332,7 +1366,7 @@ export default function App() {
       }
     });
 
-    // Realtime subscription for cross-tab and cross-device live updates
+    // Realtime subscription for cross-tab, cross-device & GitHub Pages live updates (5s diff poller + Supabase Realtime + SSE)
     const unsubscribe = subscribeToGlobalDatabaseUpdates({
       onAppBrandingUpdate: (updatedBranding) => {
         if (isMounted && updatedBranding) {
@@ -1343,7 +1377,7 @@ export default function App() {
         }
       },
       onInvertersUpdate: (updatedInverters) => {
-        if (isMounted && Array.isArray(updatedInverters)) {
+        if (isMounted && Array.isArray(updatedInverters) && updatedInverters.length > 0) {
           setCustomInverters(updatedInverters);
           try {
             localStorage.setItem('solar_sizer_custom_inverters_v3', JSON.stringify(updatedInverters));
@@ -1351,7 +1385,7 @@ export default function App() {
         }
       },
       onPanelsUpdate: (updatedPanels) => {
-        if (isMounted && Array.isArray(updatedPanels)) {
+        if (isMounted && Array.isArray(updatedPanels) && updatedPanels.length > 0) {
           const sanitized = ensureUniquePanelIds(updatedPanels);
           setCustomPanels(sanitized);
           try {
@@ -1360,7 +1394,7 @@ export default function App() {
         }
       },
       onBatteriesUpdate: (updatedBatteries) => {
-        if (isMounted && Array.isArray(updatedBatteries)) {
+        if (isMounted && Array.isArray(updatedBatteries) && updatedBatteries.length > 0) {
           setCustomBatteries(updatedBatteries);
           try {
             localStorage.setItem('solar_sizer_custom_batteries_v1', JSON.stringify(updatedBatteries));
@@ -1371,7 +1405,7 @@ export default function App() {
         if (isMounted && Array.isArray(updatedResources)) {
           setAdminResources(updatedResources);
           try {
-            localStorage.setItem('solar_sizer_admin_resources_v3', JSON.stringify(updatedResources));
+            localStorage.setItem('solar_sizer_admin_resources_v3', JSON.stringify(sanitizeResourcesForLocalCache(updatedResources)));
           } catch (e) {}
         }
       },
@@ -1388,28 +1422,15 @@ export default function App() {
           setPaymentConfig(updatedConfig);
         }
       },
+      onMountingDatabaseUpdate: (updatedDb) => {
+        if (isMounted && updatedDb && Array.isArray(updatedDb.panels)) {
+          setMountingDatabase(updatedDb);
+        }
+      },
       onLicensesUpdate: (licenses) => {
         if (isMounted && Array.isArray(licenses)) {
           setAllLicenses(licenses);
-          const currentToken = getStoredActiveLicense()?.token;
-          if (currentToken) {
-            const matched = licenses.find(l => l.token === currentToken);
-            if (matched) {
-              if (matched.status !== 'active') {
-                setActiveLicense(null);
-                saveStoredActiveLicense(null);
-                setIsPaywallLocked(true);
-                setStatusMsg({
-                  text: lang === 'my' ? '⚠️ သင့် PRO လိုင်စင်ကို Admin မှ ရုပ်သိမ်းလိုက်ပါသည်' : '⚠️ Your license has been revoked',
-                  type: 'error'
-                });
-                setTimeout(() => setStatusMsg(null), 5000);
-              } else {
-                setActiveLicense(matched);
-                saveStoredActiveLicense(matched);
-              }
-            }
-          }
+          reconcileActiveLicenseWithCloud(licenses, true);
         }
       },
       onAdminContactUpdate: (contact) => {
@@ -1422,12 +1443,18 @@ export default function App() {
         if (payload.inverters && Array.isArray(payload.inverters)) setCustomInverters(payload.inverters);
         if (payload.panels && Array.isArray(payload.panels)) setCustomPanels(ensureUniquePanelIds(payload.panels));
         if (payload.batteries && Array.isArray(payload.batteries)) setCustomBatteries(payload.batteries);
+        if (payload.adminResources && Array.isArray(payload.adminResources)) setAdminResources(payload.adminResources);
         if (payload.mountingDatabase) setMountingDatabase(payload.mountingDatabase);
         if (payload.adminContact) setAdminContact(payload.adminContact);
+        if (payload.appBranding) setAppBranding(payload.appBranding);
+        if (payload.licenses && Array.isArray(payload.licenses)) {
+          setAllLicenses(payload.licenses);
+          reconcileActiveLicenseWithCloud(payload.licenses, true);
+        }
         setStatusMsg({
           text: lang === 'my' 
-            ? '🚀 Admin မှ စနစ်နှင့် ဒေတာများကို တိုက်ရိုက် ထုတ်ဝေလိုက်ပါပြီ! (Live Update Received)' 
-            : '🚀 Admin published a live system update!',
+            ? '🚀 Admin မှ ဖိုင်များနှင့် Database အသစ်များကို Online Update လုပ်လိုက်ပါပြီ! (Live Synced)' 
+            : '🚀 Admin published a live online update!',
           type: 'success'
         });
         setTimeout(() => setStatusMsg(null), 5000);
@@ -1598,30 +1625,35 @@ export default function App() {
     const newRes: AdminResourceFile = {
       ...resource,
       id: `res_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
+      hasCloudFile: Boolean(resource.fileData && resource.fileData.startsWith('data:')),
       uploadedAt: new Date().toISOString(),
       downloadsCount: 0
     };
     const updated = [newRes, ...adminResources];
     setAdminResources(updated);
     try {
-      localStorage.setItem('solar_sizer_admin_resources_v3', JSON.stringify(updated));
+      localStorage.setItem('solar_sizer_admin_resources_v3', JSON.stringify(sanitizeResourcesForLocalCache(updated)));
     } catch (e) {}
     const syncRes = await saveAdminResourcesToCloud(updated);
+    publishLiveSystemUpdate(`New resource uploaded: ${newRes.title}`, {
+      adminResources: updated
+    }).catch(() => {});
     setStatusMsg({
       text: lang === 'my' 
-        ? (syncRes.source === 'cloud' ? "အင်ဂျင်နီယာဖိုင်အသစ် အောင်မြင်စွာ တင်ပြီး အသုံးပြုသူအားလုံးစီသို့ Real-time ဖြန့်ဝေပြီးပါပြီ!" : "အင်ဂျင်နီယာဖိုင်အသစ် သိမ်းဆည်းပြီးပါပြီ!")
-        : "Resource file successfully published & synced live to all online users!",
-      type: 'success'
+        ? (syncRes.success ? "အင်ဂျင်နီယာဖိုင်အသစ် အောင်မြင်စွာ တင်ပြီး Online အသုံးပြုသူအားလုံးစီသို့ Real-time ဖြန့်ဝေပြီးပါပြီ!" : `⚠️ ဖိုင် Cloud တင်ရာတွင် အခက်အခဲရှိပါသည် (${syncRes.error || 'size limit'})`)
+        : (syncRes.success ? "Resource file successfully published & synced live to all online users!" : `⚠️ Cloud upload issue: ${syncRes.error || 'Error'}`),
+      type: syncRes.success ? 'success' : 'error'
     });
-    setTimeout(() => setStatusMsg(null), 4000);
+    setTimeout(() => setStatusMsg(null), 4500);
   };
 
   const handleDeleteResource = async (id: string) => {
     const updated = adminResources.filter(r => r.id !== id);
     setAdminResources(updated);
     try {
-      localStorage.setItem('solar_sizer_admin_resources_v3', JSON.stringify(updated));
+      localStorage.setItem('solar_sizer_admin_resources_v3', JSON.stringify(sanitizeResourcesForLocalCache(updated)));
     } catch (e) {}
+    await deleteResourceFileFromCloud(id);
     await saveAdminResourcesToCloud(updated);
     setStatusMsg({
       text: lang === 'my' ? "ဖိုင်ကို ဖျက်သိမ်းပြီး Cloud တွင် အဆင့်မြှင့်တင်လိုက်ပါပြီ" : "Resource removed and synced across cloud.",
@@ -2041,7 +2073,9 @@ export default function App() {
       mountingDatabase: mountingDatabase,
       adminContact: adminContact,
       adminResources: adminResources,
-      appBranding: appBranding
+      appBranding: appBranding,
+      licenses: allLicenses,
+      paymentConfig: paymentConfig
     });
     return res;
   };

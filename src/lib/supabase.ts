@@ -185,6 +185,48 @@ export function initSupabase(): SupabaseClient | null {
   }
 }
 
+let sharedGlobalRealtimeChannel: any = null;
+let sharedGlobalRealtimeSubscribed = false;
+
+/**
+ * Safely broadcast a real-time event to all connected clients without unsubscribing
+ * any active listener channel. Uses active WebSocket channel if subscribed AND
+ * Supabase Realtime HTTP Broadcast API so every GitHub Pages client receives it instantaneously.
+ */
+export async function broadcastCloudEvent(event: string, payload: Record<string, any>): Promise<void> {
+  try {
+    if (sharedGlobalRealtimeChannel && sharedGlobalRealtimeSubscribed) {
+      sharedGlobalRealtimeChannel.send({
+        type: 'broadcast',
+        event,
+        payload
+      });
+    }
+  } catch (e) {}
+
+  try {
+    const { url, anonKey } = getSupabaseCredentials();
+    if (!url || !anonKey) return;
+    await fetch(`${url}/realtime/v1/api/broadcast`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        apikey: anonKey,
+        Authorization: `Bearer ${anonKey}`
+      },
+      body: JSON.stringify({
+        messages: [
+          {
+            topic: 'realtime:solar_global_database_events',
+            event,
+            payload
+          }
+        ]
+      })
+    });
+  } catch (e) {}
+}
+
 export function isSupabaseConnected(): boolean {
   const { url, anonKey } = getSupabaseCredentials();
   return Boolean(url && anonKey && url.startsWith('http'));
@@ -595,17 +637,22 @@ export async function fetchAllServerData(): Promise<{
   load_calculations?: any[] | null;
   app_branding?: AppBranding | null;
   mounting_database?: MountingDatabase | null;
-}> {
+  licenses?: LicenseToken[] | null;
+  admin_contact?: AdminContactConfig | null;
+} | null> {
   try {
     const res = await fetch('/api/data-all');
     if (res.ok) {
-      const json = await res.json();
-      if (json.success && json.data) {
-        return json.data;
+      const contentType = res.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        const json = await res.json();
+        if (json.success && json.data) {
+          return json.data;
+        }
       }
     }
   } catch (e) {}
-  return {};
+  return null;
 }
 
 // ----------------------------------------------------
@@ -663,14 +710,7 @@ export async function savePaymentRecordsToCloud(
       return { success: true, source: 'cloud', count: records.length, error: error.message };
     }
 
-    try {
-      const channel = client.channel('solar_global_database_events');
-      channel.send({
-        type: 'broadcast',
-        event: 'payment_records_changed',
-        payload: { records, timestamp: Date.now() }
-      });
-    } catch (err) {}
+    broadcastCloudEvent('payment_records_changed', { records, timestamp: Date.now() }).catch(() => {});
 
     return { success: true, source: 'cloud', count: records.length };
   } catch (err: any) {
@@ -679,19 +719,10 @@ export async function savePaymentRecordsToCloud(
 }
 
 /**
- * Fetch Payment Records from Server / Online Supabase (with Local fallback)
+ * Fetch Payment Records from Online Supabase first, then Server API / Local fallback
  */
 export async function fetchPaymentRecordsFromCloud(): Promise<{ records: any[]; source: 'cloud' | 'local' }> {
-  // 1. Try Server API first
-  const serverRecords = await fetchDataFromServer('payment_records');
-  if (serverRecords && Array.isArray(serverRecords)) {
-    try {
-      localStorage.setItem(STORAGE_PAYMENT_RECORDS_KEY, JSON.stringify(serverRecords));
-    } catch (e) {}
-    return { records: serverRecords, source: 'cloud' };
-  }
-
-  // 2. Try Supabase
+  // 1. Try Supabase Cloud first (works everywhere including GitHub Pages)
   const client = initSupabase();
   if (client) {
     try {
@@ -708,6 +739,15 @@ export async function fetchPaymentRecordsFromCloud(): Promise<{ records: any[]; 
         return { records: data.value, source: 'cloud' };
       }
     } catch (e) {}
+  }
+
+  // 2. Try Server API
+  const serverRecords = await fetchDataFromServer('payment_records');
+  if (serverRecords && Array.isArray(serverRecords)) {
+    try {
+      localStorage.setItem(STORAGE_PAYMENT_RECORDS_KEY, JSON.stringify(serverRecords));
+    } catch (e) {}
+    return { records: serverRecords, source: 'cloud' };
   }
 
   // 3. Fallback to local storage
@@ -763,6 +803,8 @@ export async function savePaymentConfigToCloud(config: any): Promise<{ success: 
       return { success: true, source: 'cloud', error: error.message };
     }
 
+    broadcastCloudEvent('payment_config_changed', { config, timestamp: Date.now() }).catch(() => {});
+
     return { success: true, source: 'cloud' };
   } catch (err: any) {
     return { success: true, source: 'cloud', error: err?.message };
@@ -770,19 +812,10 @@ export async function savePaymentConfigToCloud(config: any): Promise<{ success: 
 }
 
 /**
- * Fetch Payment Config & Bank Accounts from Server / Supabase (with Local fallback)
+ * Fetch Payment Config & Bank Accounts from Online Supabase first, then Server / Local fallback
  */
 export async function fetchPaymentConfigFromCloud(defaultConfig: any): Promise<{ config: any; source: 'cloud' | 'local' }> {
-  // 1. Try Server API first
-  const serverConfig = await fetchDataFromServer('payment_config');
-  if (serverConfig && typeof serverConfig === 'object' && Array.isArray(serverConfig.accounts)) {
-    try {
-      localStorage.setItem(STORAGE_PAYMENT_CONFIG_KEY, JSON.stringify(serverConfig));
-    } catch (e) {}
-    return { config: serverConfig, source: 'cloud' };
-  }
-
-  // 2. Try Supabase
+  // 1. Try Supabase Cloud first
   const client = initSupabase();
   if (client) {
     try {
@@ -799,6 +832,15 @@ export async function fetchPaymentConfigFromCloud(defaultConfig: any): Promise<{
         return { config: data.value, source: 'cloud' };
       }
     } catch (e) {}
+  }
+
+  // 2. Try Server API
+  const serverConfig = await fetchDataFromServer('payment_config');
+  if (serverConfig && typeof serverConfig === 'object' && Array.isArray(serverConfig.accounts)) {
+    try {
+      localStorage.setItem(STORAGE_PAYMENT_CONFIG_KEY, JSON.stringify(serverConfig));
+    } catch (e) {}
+    return { config: serverConfig, source: 'cloud' };
   }
 
   // 3. Fallback to local storage
@@ -859,7 +901,7 @@ export async function saveCustomInvertersToCloud(
 
   try {
     // Save to app_settings (both global_custom_inverters and inverters keys)
-    await client
+    const { error } = await client
       .from('app_settings')
       .upsert([
         {
@@ -874,29 +916,16 @@ export async function saveCustomInvertersToCloud(
         }
       ], { onConflict: 'id' });
 
-    // Broadcast live event via Supabase Realtime so all connected GitHub clients update instantly
-    try {
-      const liveChannel = client.channel('solar_global_database_events');
-      liveChannel.subscribe((status: string) => {
-        if (status === 'SUBSCRIBED') {
-          liveChannel.send({
-            type: 'broadcast',
-            event: 'inverters_changed',
-            payload: { inverters, count: inverters.length, timestamp: Date.now() }
-          });
-          liveChannel.send({
-            type: 'broadcast',
-            event: 'system_published',
-            payload: { inverters, timestamp: Date.now(), note: 'Inverters database updated' }
-          });
-          setTimeout(() => liveChannel.unsubscribe(), 2000);
-        }
-      });
-    } catch (err) {}
+    if (error) {
+      console.warn('Supabase inverters upsert notice:', error.message);
+    }
 
-    return { success: true, source: 'cloud', count: inverters.length };
+    // Broadcast live event via Supabase Realtime so all connected GitHub clients update instantly
+    broadcastCloudEvent('inverters_changed', { inverters, count: inverters.length, timestamp: Date.now() }).catch(() => {});
+
+    return { success: !error, source: 'cloud', count: inverters.length, error: error?.message };
   } catch (err: any) {
-    return { success: true, source: 'cloud', count: inverters.length, error: err?.message };
+    return { success: false, source: 'local', count: inverters.length, error: err?.message };
   }
 }
 
@@ -909,11 +938,22 @@ export async function fetchCustomInvertersFromCloud(): Promise<{ inverters: Inve
   const client = initSupabase();
   if (client) {
     try {
-      const { data, error } = await client
+      // IMPORTANT: Query a single exact id (never .in([...]).maybeSingle() which errors when 2 rows exist!)
+      let { data, error } = await client
         .from('app_settings')
         .select('value')
-        .in('id', ['global_custom_inverters', 'inverters'])
+        .eq('id', 'global_custom_inverters')
         .maybeSingle();
+
+      if (error || !data?.value || !Array.isArray(data.value) || data.value.length === 0) {
+        const fallbackRes = await client
+          .from('app_settings')
+          .select('value')
+          .eq('id', 'inverters')
+          .maybeSingle();
+        data = fallbackRes.data;
+        error = fallbackRes.error;
+      }
 
       if (!error && data?.value && Array.isArray(data.value) && data.value.length > 0) {
         try {
@@ -1003,7 +1043,7 @@ export async function saveCustomPanelsToCloud(
 
   try {
     // Save to app_settings (both global_custom_panels and panels keys)
-    await client
+    const { error } = await client
       .from('app_settings')
       .upsert([
         {
@@ -1018,29 +1058,16 @@ export async function saveCustomPanelsToCloud(
         }
       ], { onConflict: 'id' });
 
-    // Broadcast live event via Supabase Realtime so all connected GitHub clients update instantly
-    try {
-      const liveChannel = client.channel('solar_global_database_events');
-      liveChannel.subscribe((status: string) => {
-        if (status === 'SUBSCRIBED') {
-          liveChannel.send({
-            type: 'broadcast',
-            event: 'panels_changed',
-            payload: { panels, count: panels.length, timestamp: Date.now() }
-          });
-          liveChannel.send({
-            type: 'broadcast',
-            event: 'system_published',
-            payload: { panels, timestamp: Date.now(), note: 'Panels database updated' }
-          });
-          setTimeout(() => liveChannel.unsubscribe(), 2000);
-        }
-      });
-    } catch (err) {}
+    if (error) {
+      console.warn('Supabase panels upsert notice:', error.message);
+    }
 
-    return { success: true, source: 'cloud', count: panels.length };
+    // Broadcast live event via Supabase Realtime so all connected GitHub clients update instantly
+    broadcastCloudEvent('panels_changed', { panels, count: panels.length, timestamp: Date.now() }).catch(() => {});
+
+    return { success: !error, source: 'cloud', count: panels.length, error: error?.message };
   } catch (err: any) {
-    return { success: true, source: 'cloud', count: panels.length, error: err?.message };
+    return { success: false, source: 'local', count: panels.length, error: err?.message };
   }
 }
 
@@ -1053,11 +1080,22 @@ export async function fetchCustomPanelsFromCloud(): Promise<{ panels: PanelPrese
   const client = initSupabase();
   if (client) {
     try {
-      const { data, error } = await client
+      // IMPORTANT: Query a single exact id (never .in([...]).maybeSingle() which errors when 2 rows exist!)
+      let { data, error } = await client
         .from('app_settings')
         .select('value')
-        .in('id', ['global_custom_panels', 'panels'])
+        .eq('id', 'global_custom_panels')
         .maybeSingle();
+
+      if (error || !data?.value || !Array.isArray(data.value) || data.value.length === 0) {
+        const fallbackRes = await client
+          .from('app_settings')
+          .select('value')
+          .eq('id', 'panels')
+          .maybeSingle();
+        data = fallbackRes.data;
+        error = fallbackRes.error;
+      }
 
       if (!error && data?.value && Array.isArray(data.value) && data.value.length > 0) {
         try {
@@ -1162,26 +1200,14 @@ export async function saveCustomBatteriesToCloud(
 
     if (error) {
       console.warn('Supabase global_custom_batteries save notice:', error.message);
-      return { success: true, source: 'cloud', count: batteries.length, error: error.message };
+      return { success: false, source: 'local', count: batteries.length, error: error.message };
     }
 
-    try {
-      const liveChannel = client.channel('solar_global_database_events');
-      liveChannel.subscribe((status: string) => {
-        if (status === 'SUBSCRIBED') {
-          liveChannel.send({
-            type: 'broadcast',
-            event: 'batteries_changed',
-            payload: { batteries, count: batteries.length, timestamp: Date.now() }
-          });
-          setTimeout(() => liveChannel.unsubscribe(), 2000);
-        }
-      });
-    } catch (err) {}
+    broadcastCloudEvent('batteries_changed', { batteries, count: batteries.length, timestamp: Date.now() }).catch(() => {});
 
     return { success: true, source: 'cloud', count: batteries.length };
   } catch (err: any) {
-    return { success: true, source: 'cloud', count: batteries.length, error: err?.message };
+    return { success: false, source: 'local', count: batteries.length, error: err?.message };
   }
 }
 
@@ -1256,9 +1282,51 @@ export async function syncAllDatabaseToCloud(
   };
 }
 
+export const GLOBAL_SYNC_SETTING_IDS = [
+  'global_custom_inverters',
+  'global_custom_panels',
+  'global_custom_batteries',
+  'global_admin_resources',
+  'global_spec_requests',
+  'global_payment_config',
+  'global_payment_records',
+  'global_app_branding',
+  'global_admin_contact',
+  'admin_contact_config',
+  'global_mounting_database',
+  'global_licenses',
+  'global_system_published'
+] as const;
+
 /**
- * Realtime Subscription for Global Inverter, Panel & Battery Database Updates, Resources & Files
- * Connects to Server-Sent Events (/api/events), Supabase Realtime, and BroadcastChannel
+ * Fetch all global settings from Supabase in a single lightweight batch query
+ * (excludes heavy resource_file_* blobs so sync stays ultra-fast).
+ */
+export async function syncAllDataNowFromCloud(): Promise<Record<string, { value: any; updated_at?: string }> | null> {
+  const client = initSupabase();
+  if (!client) return null;
+  try {
+    const { data: rows, error } = await client
+      .from('app_settings')
+      .select('id, value, updated_at')
+      .in('id', [...GLOBAL_SYNC_SETTING_IDS]);
+
+    if (error || !Array.isArray(rows)) return null;
+    const map: Record<string, { value: any; updated_at?: string }> = {};
+    for (const row of rows as any[]) {
+      if (row && row.id) {
+        map[row.id] = { value: row.value, updated_at: row.updated_at };
+      }
+    }
+    return map;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Realtime Subscription for Global Inverter, Panel & Battery Database Updates, Resources, Files & Licenses
+ * Connects to Server-Sent Events (/api/events), Supabase Realtime, BroadcastChannel, and 5s Diff Poller
  */
 export function subscribeToGlobalDatabaseUpdates(callbacks: {
   onInvertersUpdate?: (inverters: Inverter[]) => void;
@@ -1271,14 +1339,81 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
   onAppBrandingUpdate?: (branding: AppBranding) => void;
   onLicensesUpdate?: (licenses: LicenseToken[]) => void;
   onAdminContactUpdate?: (contact: AdminContactConfig) => void;
-  onSystemPublished?: (payload: { timestamp: string; note?: string; inverters?: Inverter[]; panels?: PanelPreset[]; batteries?: BatteryPreset[]; mountingDatabase?: any; adminContact?: AdminContactConfig }) => void;
+  onMountingDatabaseUpdate?: (db: MountingDatabase) => void;
+  onSystemPublished?: (payload: {
+    timestamp: string;
+    note?: string;
+    inverters?: Inverter[];
+    panels?: PanelPreset[];
+    batteries?: BatteryPreset[];
+    mountingDatabase?: any;
+    adminContact?: AdminContactConfig;
+    adminResources?: AdminResourceFile[];
+    appBranding?: AppBranding;
+    licenses?: LicenseToken[];
+  }) => void;
 }): () => void {
   let isCleanedUp = false;
   let broadcastChannel: BroadcastChannel | null = null;
   let supabaseChannel: any = null;
   let eventSource: EventSource | null = null;
+  const lastSeenUpdatedAt: Record<string, string> = {};
+  let hasCompletedInitialPoll = false;
 
-  // 1. Server-Sent Events (SSE) stream for instant real-time sync across all clients
+  const applySettingRow = (id: string, value: any, updatedAt?: string, isInitialHydration: boolean = false) => {
+    if (isCleanedUp || value === undefined || value === null) return;
+    const stamp = updatedAt || '';
+    if (!isInitialHydration && stamp && lastSeenUpdatedAt[id] === stamp) {
+      return;
+    }
+    if (stamp) {
+      lastSeenUpdatedAt[id] = stamp;
+    }
+
+    if (id === 'global_custom_inverters' && Array.isArray(value) && value.length > 0 && callbacks.onInvertersUpdate) {
+      try { localStorage.setItem(STORAGE_CUSTOM_INVERTERS_KEY, JSON.stringify(value)); } catch (e) {}
+      callbacks.onInvertersUpdate(value);
+    } else if (id === 'global_custom_panels' && Array.isArray(value) && value.length > 0 && callbacks.onPanelsUpdate) {
+      try { localStorage.setItem(STORAGE_CUSTOM_PANELS_KEY, JSON.stringify(value)); } catch (e) {}
+      callbacks.onPanelsUpdate(value);
+    } else if (id === 'global_custom_batteries' && Array.isArray(value) && value.length > 0 && callbacks.onBatteriesUpdate) {
+      try { localStorage.setItem(STORAGE_CUSTOM_BATTERIES_KEY, JSON.stringify(value)); } catch (e) {}
+      callbacks.onBatteriesUpdate(value);
+    } else if (id === 'global_admin_resources' && Array.isArray(value) && callbacks.onResourcesUpdate) {
+      try { localStorage.setItem(STORAGE_ADMIN_RESOURCES_KEY, JSON.stringify(sanitizeResourcesForLocalCache(value))); } catch (e) {}
+      callbacks.onResourcesUpdate(value);
+    } else if (id === 'global_spec_requests' && Array.isArray(value) && callbacks.onSpecRequestsUpdate) {
+      try { localStorage.setItem(STORAGE_SPEC_REQUESTS_KEY, JSON.stringify(value)); } catch (e) {}
+      callbacks.onSpecRequestsUpdate(value);
+    } else if (id === 'global_payment_config' && typeof value === 'object' && Array.isArray(value.accounts) && callbacks.onPaymentConfigUpdate) {
+      try { localStorage.setItem(STORAGE_PAYMENT_CONFIG_KEY, JSON.stringify(value)); } catch (e) {}
+      callbacks.onPaymentConfigUpdate(value);
+    } else if (id === 'global_payment_records' && Array.isArray(value) && callbacks.onPaymentRecordsUpdate) {
+      try { localStorage.setItem(STORAGE_PAYMENT_RECORDS_KEY, JSON.stringify(value)); } catch (e) {}
+      callbacks.onPaymentRecordsUpdate(value);
+    } else if (id === 'global_app_branding' && typeof value === 'object' && callbacks.onAppBrandingUpdate) {
+      try { localStorage.setItem(STORAGE_APP_BRANDING_KEY, JSON.stringify(value)); } catch (e) {}
+      callbacks.onAppBrandingUpdate(value);
+    } else if ((id === 'global_admin_contact' || id === 'admin_contact_config') && typeof value === 'object' && callbacks.onAdminContactUpdate) {
+      try { localStorage.setItem(STORAGE_ADMIN_CONTACT_KEY, JSON.stringify(value)); } catch (e) {}
+      callbacks.onAdminContactUpdate(value);
+    } else if (id === 'global_mounting_database' && typeof value === 'object' && Array.isArray(value.panels)) {
+      try { localStorage.setItem('solar_mounting_database_v1', JSON.stringify(value)); } catch (e) {}
+      if (callbacks.onMountingDatabaseUpdate) {
+        callbacks.onMountingDatabaseUpdate(value);
+      }
+    } else if (id === 'global_licenses' && Array.isArray(value) && callbacks.onLicensesUpdate) {
+      try { localStorage.setItem(STORAGE_ALL_LICENSES_KEY, JSON.stringify(value)); } catch (e) {}
+      callbacks.onLicensesUpdate(value);
+    } else if (id === 'global_system_published' && !isInitialHydration && callbacks.onSystemPublished) {
+      callbacks.onSystemPublished({
+        timestamp: value?.publishedAt || updatedAt || new Date().toISOString(),
+        note: value?.note || 'Admin published a live update'
+      });
+    }
+  };
+
+  // 1. Server-Sent Events (SSE) stream (when local/hosted Express backend is running)
   if (typeof EventSource !== 'undefined') {
     try {
       eventSource = new EventSource('/api/events');
@@ -1288,7 +1423,7 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           const parsed = JSON.parse(event.data);
           const { type, data } = parsed;
           if (type === 'resources' && Array.isArray(data) && callbacks.onResourcesUpdate) {
-            try { localStorage.setItem(STORAGE_ADMIN_RESOURCES_KEY, JSON.stringify(data)); } catch (e) {}
+            try { localStorage.setItem(STORAGE_ADMIN_RESOURCES_KEY, JSON.stringify(sanitizeResourcesForLocalCache(data))); } catch (e) {}
             callbacks.onResourcesUpdate(data);
           } else if (type === 'inverters' && Array.isArray(data) && callbacks.onInvertersUpdate) {
             try { localStorage.setItem(STORAGE_CUSTOM_INVERTERS_KEY, JSON.stringify(data)); } catch (e) {}
@@ -1316,6 +1451,8 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           } else if (type === 'admin_contact' && data && callbacks.onAdminContactUpdate) {
             try { localStorage.setItem(STORAGE_ADMIN_CONTACT_KEY, JSON.stringify(data)); } catch (e) {}
             callbacks.onAdminContactUpdate(data);
+          } else if (type === 'mounting_database' && data && callbacks.onMountingDatabaseUpdate) {
+            callbacks.onMountingDatabaseUpdate(data);
           } else if (type === 'system_published' && data && callbacks.onSystemPublished) {
             callbacks.onSystemPublished(data);
           }
@@ -1345,17 +1482,23 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           callbacks.onPaymentRecordsUpdate(data.records);
         } else if (data?.type === 'APP_BRANDING_UPDATED' && data.branding && callbacks.onAppBrandingUpdate) {
           callbacks.onAppBrandingUpdate(data.branding);
+        } else if (data?.type === 'LICENSES_UPDATED' && Array.isArray(data.licenses) && callbacks.onLicensesUpdate) {
+          callbacks.onLicensesUpdate(data.licenses);
+        } else if (data?.type === 'ADMIN_CONTACT_UPDATED' && data.contact && callbacks.onAdminContactUpdate) {
+          callbacks.onAdminContactUpdate(data.contact);
         }
       };
     } catch (e) {}
   }
 
-  // 3. Supabase Realtime Channel
+  // 3. Supabase Realtime Channel (WebSocket Broadcast + Postgres Changes)
   const client = initSupabase();
   if (client) {
     try {
       supabaseChannel = client.channel('solar_global_database_events');
-      
+      sharedGlobalRealtimeChannel = supabaseChannel;
+      sharedGlobalRealtimeSubscribed = false;
+
       supabaseChannel
         .on('broadcast', { event: 'inverters_changed' }, (payload: any) => {
           if (isCleanedUp) return;
@@ -1378,6 +1521,27 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
             callbacks.onBatteriesUpdate(payload.payload.batteries);
           }
         })
+        .on('broadcast', { event: 'licenses_changed' }, (payload: any) => {
+          if (isCleanedUp) return;
+          if (payload?.payload?.licenses && Array.isArray(payload.payload.licenses) && callbacks.onLicensesUpdate) {
+            try { localStorage.setItem(STORAGE_ALL_LICENSES_KEY, JSON.stringify(payload.payload.licenses)); } catch (e) {}
+            callbacks.onLicensesUpdate(payload.payload.licenses);
+          }
+        })
+        .on('broadcast', { event: 'admin_contact_changed' }, (payload: any) => {
+          if (isCleanedUp) return;
+          if (payload?.payload?.contact && callbacks.onAdminContactUpdate) {
+            try { localStorage.setItem(STORAGE_ADMIN_CONTACT_KEY, JSON.stringify(payload.payload.contact)); } catch (e) {}
+            callbacks.onAdminContactUpdate(payload.payload.contact);
+          }
+        })
+        .on('broadcast', { event: 'payment_config_changed' }, (payload: any) => {
+          if (isCleanedUp) return;
+          if (payload?.payload?.config && callbacks.onPaymentConfigUpdate) {
+            try { localStorage.setItem(STORAGE_PAYMENT_CONFIG_KEY, JSON.stringify(payload.payload.config)); } catch (e) {}
+            callbacks.onPaymentConfigUpdate(payload.payload.config);
+          }
+        })
         .on('broadcast', { event: 'system_published' }, (payload: any) => {
           if (isCleanedUp) return;
           const data = payload?.payload;
@@ -1394,6 +1558,14 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
               try { localStorage.setItem(STORAGE_CUSTOM_BATTERIES_KEY, JSON.stringify(data.batteries)); } catch (e) {}
               callbacks.onBatteriesUpdate(data.batteries);
             }
+            if (data.adminResources && Array.isArray(data.adminResources) && callbacks.onResourcesUpdate) {
+              try { localStorage.setItem(STORAGE_ADMIN_RESOURCES_KEY, JSON.stringify(sanitizeResourcesForLocalCache(data.adminResources))); } catch (e) {}
+              callbacks.onResourcesUpdate(data.adminResources);
+            }
+            if (data.mountingDatabase && callbacks.onMountingDatabaseUpdate) {
+              try { localStorage.setItem('solar_mounting_database_v1', JSON.stringify(data.mountingDatabase)); } catch (e) {}
+              callbacks.onMountingDatabaseUpdate(data.mountingDatabase);
+            }
             if (data.adminContact && callbacks.onAdminContactUpdate) {
               try { localStorage.setItem(STORAGE_ADMIN_CONTACT_KEY, JSON.stringify(data.adminContact)); } catch (e) {}
               callbacks.onAdminContactUpdate(data.adminContact);
@@ -1401,6 +1573,10 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
             if (data.appBranding && callbacks.onAppBrandingUpdate) {
               try { localStorage.setItem(STORAGE_APP_BRANDING_KEY, JSON.stringify(data.appBranding)); } catch (e) {}
               callbacks.onAppBrandingUpdate(data.appBranding);
+            }
+            if (data.licenses && Array.isArray(data.licenses) && callbacks.onLicensesUpdate) {
+              try { localStorage.setItem(STORAGE_ALL_LICENSES_KEY, JSON.stringify(data.licenses)); } catch (e) {}
+              callbacks.onLicensesUpdate(data.licenses);
             }
             if (callbacks.onSystemPublished) {
               callbacks.onSystemPublished(data);
@@ -1410,14 +1586,17 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
         .on('broadcast', { event: 'mounting_database_changed' }, (payload: any) => {
           if (isCleanedUp) return;
           const data = payload?.payload;
-          if (data?.mountingDatabase && callbacks.onSystemPublished) {
-            callbacks.onSystemPublished({ timestamp: new Date().toISOString(), mountingDatabase: data.mountingDatabase });
+          if (data?.mountingDatabase) {
+            try { localStorage.setItem('solar_mounting_database_v1', JSON.stringify(data.mountingDatabase)); } catch (e) {}
+            if (callbacks.onMountingDatabaseUpdate) {
+              callbacks.onMountingDatabaseUpdate(data.mountingDatabase);
+            }
           }
         })
         .on('broadcast', { event: 'resources_changed' }, (payload: any) => {
           if (isCleanedUp) return;
           if (payload?.payload?.resources && Array.isArray(payload.payload.resources) && callbacks.onResourcesUpdate) {
-            try { localStorage.setItem(STORAGE_ADMIN_RESOURCES_KEY, JSON.stringify(payload.payload.resources)); } catch (e) {}
+            try { localStorage.setItem(STORAGE_ADMIN_RESOURCES_KEY, JSON.stringify(sanitizeResourcesForLocalCache(payload.payload.resources))); } catch (e) {}
             callbacks.onResourcesUpdate(payload.payload.resources);
           }
         })
@@ -1445,99 +1624,56 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
         .on('postgres_changes', { event: '*', schema: 'public', table: 'app_settings' }, (payload: any) => {
           if (isCleanedUp) return;
           const rec = payload.new;
-          if (rec?.id === 'global_custom_inverters' && Array.isArray(rec.value) && callbacks.onInvertersUpdate) {
-            try { localStorage.setItem(STORAGE_CUSTOM_INVERTERS_KEY, JSON.stringify(rec.value)); } catch (e) {}
-            callbacks.onInvertersUpdate(rec.value);
-          } else if (rec?.id === 'global_custom_panels' && Array.isArray(rec.value) && callbacks.onPanelsUpdate) {
-            try { localStorage.setItem(STORAGE_CUSTOM_PANELS_KEY, JSON.stringify(rec.value)); } catch (e) {}
-            callbacks.onPanelsUpdate(rec.value);
-          } else if (rec?.id === 'global_custom_batteries' && Array.isArray(rec.value) && callbacks.onBatteriesUpdate) {
-            try { localStorage.setItem(STORAGE_CUSTOM_BATTERIES_KEY, JSON.stringify(rec.value)); } catch (e) {}
-            callbacks.onBatteriesUpdate(rec.value);
-          } else if (rec?.id === 'global_admin_resources' && Array.isArray(rec.value) && callbacks.onResourcesUpdate) {
-            try { localStorage.setItem(STORAGE_ADMIN_RESOURCES_KEY, JSON.stringify(rec.value)); } catch (e) {}
-            callbacks.onResourcesUpdate(rec.value);
-          } else if (rec?.id === 'global_spec_requests' && Array.isArray(rec.value) && callbacks.onSpecRequestsUpdate) {
-            try { localStorage.setItem(STORAGE_SPEC_REQUESTS_KEY, JSON.stringify(rec.value)); } catch (e) {}
-            callbacks.onSpecRequestsUpdate(rec.value);
-          } else if (rec?.id === 'global_payment_config' && rec?.value && callbacks.onPaymentConfigUpdate) {
-            callbacks.onPaymentConfigUpdate(rec.value);
-          } else if (rec?.id === 'global_payment_records' && Array.isArray(rec.value) && callbacks.onPaymentRecordsUpdate) {
-            try { localStorage.setItem(STORAGE_PAYMENT_RECORDS_KEY, JSON.stringify(rec.value)); } catch (e) {}
-            callbacks.onPaymentRecordsUpdate(rec.value);
-          } else if (rec?.id === 'global_app_branding' && rec?.value && callbacks.onAppBrandingUpdate) {
-            try { localStorage.setItem(STORAGE_APP_BRANDING_KEY, JSON.stringify(rec.value)); } catch (e) {}
-            callbacks.onAppBrandingUpdate(rec.value);
-          } else if (rec?.id === 'global_admin_contact' && rec?.value && callbacks.onAdminContactUpdate) {
-            try { localStorage.setItem(STORAGE_ADMIN_CONTACT_KEY, JSON.stringify(rec.value)); } catch (e) {}
-            callbacks.onAdminContactUpdate(rec.value);
-          } else if (rec?.id === 'global_mounting_database' && rec?.value && callbacks.onSystemPublished) {
-            callbacks.onSystemPublished({ timestamp: rec.updated_at || new Date().toISOString(), mountingDatabase: rec.value });
+          if (rec?.id && GLOBAL_SYNC_SETTING_IDS.includes(rec.id)) {
+            applySettingRow(rec.id, rec.value, rec.updated_at, false);
           }
         })
-        .subscribe();
+        .subscribe((status: string) => {
+          sharedGlobalRealtimeSubscribed = status === 'SUBSCRIBED';
+        });
     } catch (e) {}
   }
 
-  // 4. Periodic Cloud Sync Poller (checks Supabase Cloud every 8 seconds - vital for GitHub Pages)
+  // 4. Smart Periodic Cloud Sync Poller (every 5 seconds - guarantees real-time sync on GitHub Pages even behind strict Myanmar mobile networks)
   const syncSupabaseData = async () => {
     if (isCleanedUp) return;
-    const client = initSupabase();
-    if (client) {
-      try {
-        const { data: rows } = await client
-          .from('app_settings')
-          .select('id, value, updated_at');
-
-        if (Array.isArray(rows) && rows.length > 0 && !isCleanedUp) {
-          rows.forEach((row: any) => {
-            if (row.id === 'global_custom_inverters' && Array.isArray(row.value) && callbacks.onInvertersUpdate) {
-              callbacks.onInvertersUpdate(row.value);
-            } else if (row.id === 'global_custom_panels' && Array.isArray(row.value) && callbacks.onPanelsUpdate) {
-              callbacks.onPanelsUpdate(row.value);
-            } else if (row.id === 'global_custom_batteries' && Array.isArray(row.value) && callbacks.onBatteriesUpdate) {
-              callbacks.onBatteriesUpdate(row.value);
-            } else if (row.id === 'global_admin_resources' && Array.isArray(row.value) && callbacks.onResourcesUpdate) {
-              callbacks.onResourcesUpdate(row.value);
-            } else if (row.id === 'global_admin_contact' && row.value && callbacks.onAdminContactUpdate) {
-              callbacks.onAdminContactUpdate(row.value);
-            } else if (row.id === 'global_app_branding' && row.value && callbacks.onAppBrandingUpdate) {
-              callbacks.onAppBrandingUpdate(row.value);
-            } else if (row.id === 'global_mounting_database' && row.value && callbacks.onSystemPublished) {
-              callbacks.onSystemPublished({ timestamp: row.updated_at || new Date().toISOString(), mountingDatabase: row.value });
-            }
-          });
-        }
-      } catch (err) {}
-    }
-
-    // Also check server if running locally
-    try {
-      const allData = await fetchAllServerData();
-      if (!isCleanedUp && allData) {
-        if (allData.inverters && Array.isArray(allData.inverters) && allData.inverters.length > 0 && callbacks.onInvertersUpdate) {
-          callbacks.onInvertersUpdate(allData.inverters);
-        }
-        if (allData.panels && Array.isArray(allData.panels) && allData.panels.length > 0 && callbacks.onPanelsUpdate) {
-          callbacks.onPanelsUpdate(allData.panels);
-        }
-        if (allData.batteries && Array.isArray(allData.batteries) && allData.batteries.length > 0 && callbacks.onBatteriesUpdate) {
-          callbacks.onBatteriesUpdate(allData.batteries);
+    const map = await syncAllDataNowFromCloud();
+    if (map && !isCleanedUp) {
+      const isInitial = !hasCompletedInitialPoll;
+      // Apply all datasets before global_system_published so state is already fresh when publish toast triggers
+      for (const key of GLOBAL_SYNC_SETTING_IDS) {
+        if (key === 'global_system_published') continue;
+        const entry = map[key];
+        if (entry) {
+          applySettingRow(key, entry.value, entry.updated_at, isInitial);
         }
       }
-    } catch (e) {}
+      if (map['global_system_published']) {
+        applySettingRow(
+          'global_system_published',
+          map['global_system_published'].value,
+          map['global_system_published'].updated_at,
+          isInitial
+        );
+      }
+      hasCompletedInitialPoll = true;
+    }
   };
 
-  const pollInterval = setInterval(syncSupabaseData, 8000);
+  // Run an immediate initial cloud poll right away so all datasets & licenses hydrate in 1 fast call
+  syncSupabaseData();
 
-  // Sync immediately when tab regains focus or becomes visible
+  const pollInterval = setInterval(syncSupabaseData, 5000);
+
+  // Sync immediately when tab regains focus, becomes visible, or network reconnects
   const handleVisibility = () => {
-    if (typeof document !== 'undefined' && !document.hidden) {
+    if (typeof document === 'undefined' || !document.hidden) {
       syncSupabaseData();
     }
   };
   if (typeof window !== 'undefined') {
     window.addEventListener('focus', handleVisibility);
+    window.addEventListener('online', handleVisibility);
     document.addEventListener('visibilitychange', handleVisibility);
   }
 
@@ -1546,6 +1682,7 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
     clearInterval(pollInterval);
     if (typeof window !== 'undefined') {
       window.removeEventListener('focus', handleVisibility);
+      window.removeEventListener('online', handleVisibility);
       document.removeEventListener('visibilitychange', handleVisibility);
     }
     if (eventSource) {
@@ -1555,6 +1692,10 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
       try { broadcastChannel.close(); } catch (e) {}
     }
     if (supabaseChannel) {
+      if (sharedGlobalRealtimeChannel === supabaseChannel) {
+        sharedGlobalRealtimeChannel = null;
+        sharedGlobalRealtimeSubscribed = false;
+      }
       try { supabaseChannel.unsubscribe(); } catch (e) {}
     }
   };
@@ -1567,28 +1708,74 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
 const STORAGE_ADMIN_RESOURCES_KEY = 'solar_sizer_admin_resources_v3';
 const STORAGE_SPEC_REQUESTS_KEY = 'solar_sizer_spec_requests_v3';
 
-// Helper to strip heavy base64 data before saving to browser localStorage
+// Helper to strip heavy base64 data before saving metadata list to localStorage or global_admin_resources
 export function sanitizeResourcesForLocalCache(resources: AdminResourceFile[]): AdminResourceFile[] {
   if (!Array.isArray(resources)) return [];
   return resources.map(res => {
     const fileUrl = res.fileUrl || `/api/files/${res.id}`;
-    // If base64 fileData is large (>10KB), do not store in 5MB localStorage
+    const hasInlineData = Boolean(res.fileData && res.fileData.startsWith('data:'));
+    const hasCloudFile = Boolean(res.hasCloudFile || hasInlineData);
+    // Keep small files inline (<10KB), move large files to dedicated cloud row `resource_file_<id>`
     if (res.fileData && res.fileData.length > 10000) {
       return {
         ...res,
         fileUrl,
+        hasCloudFile,
         fileData: undefined
       };
     }
     return {
       ...res,
-      fileUrl
+      fileUrl,
+      hasCloudFile
     };
   });
 }
 
 /**
- * Save Admin Resources / Files to Server, Online Supabase and Local Storage
+ * Fetch actual binary fileData (base64 data URL) for an Admin Resource File from Supabase Cloud
+ * so PRO users on GitHub Pages can download any PDF, CSV, diagram, or guide uploaded by Admin.
+ */
+export async function fetchResourceFileDataFromCloud(resourceId: string): Promise<string | null> {
+  if (!resourceId) return null;
+  const client = initSupabase();
+  if (!client) return null;
+  try {
+    const { data, error } = await client
+      .from('app_settings')
+      .select('value')
+      .eq('id', `resource_file_${resourceId}`)
+      .maybeSingle();
+
+    if (!error && data?.value) {
+      if (typeof data.value === 'string' && data.value.startsWith('data:')) {
+        return data.value;
+      }
+      if (typeof data.value === 'object' && typeof data.value.fileData === 'string') {
+        return data.value.fileData;
+      }
+    }
+  } catch (e) {}
+  return null;
+}
+
+/**
+ * Remove stored binary file blob from Supabase Cloud when Admin deletes a resource.
+ */
+export async function deleteResourceFileFromCloud(resourceId: string): Promise<void> {
+  if (!resourceId) return;
+  const client = initSupabase();
+  if (!client) return;
+  try {
+    await client
+      .from('app_settings')
+      .delete()
+      .eq('id', `resource_file_${resourceId}`);
+  } catch (e) {}
+}
+
+/**
+ * Save Admin Resources / Files to Server, Online Supabase (including actual binary files!) and Local Storage
  * Broadcasts to all connected users in real time
  */
 export async function saveAdminResourcesToCloud(
@@ -1601,13 +1788,17 @@ export async function saveAdminResourcesToCloud(
     localStorage.setItem(STORAGE_ADMIN_RESOURCES_KEY, JSON.stringify(sanitized));
   } catch (e) {
     try {
-      // If still quota error, strip all fileData
-      const minimal = resources.map(r => ({ ...r, fileUrl: `/api/files/${r.id}`, fileData: undefined }));
+      const minimal = resources.map(r => ({
+        ...r,
+        fileUrl: `/api/files/${r.id}`,
+        hasCloudFile: Boolean(r.hasCloudFile || r.fileData),
+        fileData: undefined
+      }));
       localStorage.setItem(STORAGE_ADMIN_RESOURCES_KEY, JSON.stringify(minimal));
     } catch (e2) {}
   }
 
-  // 2. Post full data to central Express backend (so disk files are saved)
+  // 2. Post full data to central Express backend (so disk files are saved if running locally)
   postDataToServer('resources', resources);
 
   // 3. Broadcast across local browser tabs instantly
@@ -1624,62 +1815,66 @@ export async function saveAdminResourcesToCloud(
     } catch (e) {}
   }
 
-  // 4. Persist to Supabase app_settings table for all users (using sanitized to prevent JSONB quota limits)
+  // 4. Persist binary fileData per-resource + lightweight metadata list to Supabase app_settings
   const client = initSupabase();
   if (!client) {
     return { success: true, source: 'cloud', count: resources.length };
   }
 
   try {
+    const nowIso = new Date().toISOString();
+
+    // Upload any new/inline binary file blobs to their own row (`resource_file_<id>`)
+    for (const res of resources) {
+      if (res.fileData && res.fileData.startsWith('data:')) {
+        try {
+          const { error: fileErr } = await client
+            .from('app_settings')
+            .upsert({
+              id: `resource_file_${res.id}`,
+              value: {
+                id: res.id,
+                fileName: res.fileName,
+                fileType: res.fileType,
+                fileData: res.fileData
+              },
+              updated_at: nowIso
+            }, { onConflict: 'id' });
+          if (fileErr) {
+            console.warn(`Supabase resource file upload notice (${res.fileName}):`, fileErr.message);
+          }
+        } catch (fileEx) {}
+      }
+    }
+
     const { error } = await client
       .from('app_settings')
       .upsert({
         id: 'global_admin_resources',
         value: sanitized,
-        updated_at: new Date().toISOString()
+        updated_at: nowIso
       }, { onConflict: 'id' });
 
     if (error) {
       console.warn('Supabase global_admin_resources save notice:', error.message);
-      return { success: true, source: 'cloud', count: resources.length, error: error.message };
+      return { success: false, source: 'local', count: resources.length, error: error.message };
     }
 
-    try {
-      const liveChannel = client.channel('solar_global_database_events');
-      liveChannel.subscribe((status: string) => {
-        if (status === 'SUBSCRIBED') {
-          liveChannel.send({
-            type: 'broadcast',
-            event: 'resources_changed',
-            payload: { resources: sanitized, count: resources.length, timestamp: Date.now() }
-          });
-          setTimeout(() => liveChannel.unsubscribe(), 2000);
-        }
-      });
-    } catch (err) {}
+    broadcastCloudEvent('resources_changed', { resources: sanitized, count: resources.length, timestamp: Date.now() }).catch(() => {});
 
     return { success: true, source: 'cloud', count: resources.length };
   } catch (err: any) {
-    return { success: true, source: 'cloud', count: resources.length, error: err?.message };
+    return { success: false, source: 'local', count: resources.length, error: err?.message };
   }
 }
 
 /**
- * Fetch Admin Resources / Files from Server / Online Supabase (with fallback)
+ * Fetch Admin Resources / Files from Online Supabase first, then Server API / Local fallback
  */
 export async function fetchAdminResourcesFromCloud(
   defaultResources: AdminResourceFile[] = INITIAL_ADMIN_RESOURCES
 ): Promise<{ resources: AdminResourceFile[]; source: 'cloud' | 'local' }> {
-  // 1. Try Server API first
-  const serverResources = await fetchDataFromServer('resources');
-  if (serverResources && Array.isArray(serverResources) && serverResources.length > 0) {
-    try {
-      localStorage.setItem(STORAGE_ADMIN_RESOURCES_KEY, JSON.stringify(serverResources));
-    } catch (e) {}
-    return { resources: serverResources, source: 'cloud' };
-  }
-
-  // 2. Try Supabase
+  // 1. Try Supabase Cloud first (works everywhere including GitHub Pages)
   const client = initSupabase();
   if (client) {
     try {
@@ -1689,13 +1884,22 @@ export async function fetchAdminResourcesFromCloud(
         .eq('id', 'global_admin_resources')
         .maybeSingle();
 
-      if (!error && data?.value && Array.isArray(data.value) && data.value.length > 0) {
+      if (!error && data?.value && Array.isArray(data.value)) {
         try {
-          localStorage.setItem(STORAGE_ADMIN_RESOURCES_KEY, JSON.stringify(data.value));
+          localStorage.setItem(STORAGE_ADMIN_RESOURCES_KEY, JSON.stringify(sanitizeResourcesForLocalCache(data.value)));
         } catch (e) {}
         return { resources: data.value, source: 'cloud' };
       }
     } catch (e) {}
+  }
+
+  // 2. Try Server API
+  const serverResources = await fetchDataFromServer('resources');
+  if (serverResources && Array.isArray(serverResources) && serverResources.length > 0) {
+    try {
+      localStorage.setItem(STORAGE_ADMIN_RESOURCES_KEY, JSON.stringify(sanitizeResourcesForLocalCache(serverResources)));
+    } catch (e) {}
+    return { resources: serverResources, source: 'cloud' };
   }
 
   // 3. Fallback to local storage
@@ -1752,43 +1956,24 @@ export async function saveSpecRequestsToCloud(
       }, { onConflict: 'id' });
 
     if (error) {
-      return { success: true, source: 'cloud', count: requests.length, error: error.message };
+      return { success: false, source: 'local', count: requests.length, error: error.message };
     }
 
-    try {
-      const liveChannel = client.channel('solar_global_database_events');
-      liveChannel.subscribe((status: string) => {
-        if (status === 'SUBSCRIBED') {
-          liveChannel.send({
-            type: 'broadcast',
-            event: 'spec_requests_changed',
-            payload: { requests, count: requests.length, timestamp: Date.now() }
-          });
-          setTimeout(() => liveChannel.unsubscribe(), 2000);
-        }
-      });
-    } catch (err) {}
+    broadcastCloudEvent('spec_requests_changed', { requests, count: requests.length, timestamp: Date.now() }).catch(() => {});
 
     return { success: true, source: 'cloud', count: requests.length };
   } catch (err: any) {
-    return { success: true, source: 'cloud', count: requests.length, error: err?.message };
+    return { success: false, source: 'local', count: requests.length, error: err?.message };
   }
 }
 
 /**
- * Fetch Spec Requests from Server / Online Supabase
+ * Fetch Spec Requests from Online Supabase first, then Server API / Local fallback
  */
 export async function fetchSpecRequestsFromCloud(
   defaultRequests: SpecRequest[] = INITIAL_SPEC_REQUESTS
 ): Promise<{ requests: SpecRequest[]; source: 'cloud' | 'local' }> {
-  const serverRequests = await fetchDataFromServer('spec_requests');
-  if (serverRequests && Array.isArray(serverRequests) && serverRequests.length > 0) {
-    try {
-      localStorage.setItem(STORAGE_SPEC_REQUESTS_KEY, JSON.stringify(serverRequests));
-    } catch (e) {}
-    return { requests: serverRequests, source: 'cloud' };
-  }
-
+  // 1. Try Supabase Cloud first
   const client = initSupabase();
   if (client) {
     try {
@@ -1805,6 +1990,15 @@ export async function fetchSpecRequestsFromCloud(
         return { requests: data.value, source: 'cloud' };
       }
     } catch (e) {}
+  }
+
+  // 2. Try Server API
+  const serverRequests = await fetchDataFromServer('spec_requests');
+  if (serverRequests && Array.isArray(serverRequests) && serverRequests.length > 0) {
+    try {
+      localStorage.setItem(STORAGE_SPEC_REQUESTS_KEY, JSON.stringify(serverRequests));
+    } catch (e) {}
+    return { requests: serverRequests, source: 'cloud' };
   }
 
   try {
@@ -1836,7 +2030,7 @@ export const DEFAULT_APP_BRANDING: AppBranding = {
 
 /**
  * Save App Branding & Logo to Server, Supabase, and Local Cache
- * Broadcasts across SSE and BroadcastChannel to sync all active users in real-time
+ * Broadcasts across SSE, Supabase Realtime, and BroadcastChannel to sync all active users in real-time
  */
 export async function saveAppBrandingToCloud(
   branding: AppBranding
@@ -1847,7 +2041,7 @@ export async function saveAppBrandingToCloud(
   } catch (e) {}
 
   // 2. Post to central Express backend
-  await postDataToServer('app_branding', branding);
+  postDataToServer('app_branding', branding);
 
   // 3. Broadcast across local browser tabs instantly
   if (typeof BroadcastChannel !== 'undefined') {
@@ -1862,7 +2056,7 @@ export async function saveAppBrandingToCloud(
     } catch (e) {}
   }
 
-  // 4. Persist to Supabase if connected
+  // 4. Persist to Supabase
   const client = initSupabase();
   if (!client) {
     return { success: true, source: 'cloud' };
@@ -1878,45 +2072,24 @@ export async function saveAppBrandingToCloud(
       }, { onConflict: 'id' });
 
     if (error) {
-      return { success: true, source: 'cloud', error: error.message };
+      return { success: false, source: 'local', error: error.message };
     }
 
-    try {
-      const liveChannel = client.channel('solar_global_database_events');
-      liveChannel.subscribe((status: string) => {
-        if (status === 'SUBSCRIBED') {
-          liveChannel.send({
-            type: 'broadcast',
-            event: 'app_branding_changed',
-            payload: { branding, timestamp: Date.now() }
-          });
-          setTimeout(() => liveChannel.unsubscribe(), 2000);
-        }
-      });
-    } catch (err) {}
+    broadcastCloudEvent('app_branding_changed', { branding, timestamp: Date.now() }).catch(() => {});
 
     return { success: true, source: 'cloud' };
   } catch (err: any) {
-    return { success: true, source: 'cloud', error: err?.message };
+    return { success: false, source: 'local', error: err?.message };
   }
 }
 
 /**
- * Fetch App Branding & Logo from Server / Supabase / Local Storage
+ * Fetch App Branding & Logo from Online Supabase first, then Server / Local Storage
  */
 export async function fetchAppBrandingFromCloud(
   defaultBranding: AppBranding = DEFAULT_APP_BRANDING
 ): Promise<{ branding: AppBranding; source: 'cloud' | 'local' }> {
-  // 1. Try Server API first
-  const serverBranding = await fetchDataFromServer('app_branding');
-  if (serverBranding && typeof serverBranding === 'object') {
-    try {
-      localStorage.setItem(STORAGE_APP_BRANDING_KEY, JSON.stringify(serverBranding));
-    } catch (e) {}
-    return { branding: serverBranding, source: 'cloud' };
-  }
-
-  // 2. Try Supabase
+  // 1. Try Supabase Cloud first
   const client = initSupabase();
   if (client) {
     try {
@@ -1933,6 +2106,15 @@ export async function fetchAppBrandingFromCloud(
         return { branding: data.value, source: 'cloud' };
       }
     } catch (e) {}
+  }
+
+  // 2. Try Server API
+  const serverBranding = await fetchDataFromServer('app_branding');
+  if (serverBranding && typeof serverBranding === 'object') {
+    try {
+      localStorage.setItem(STORAGE_APP_BRANDING_KEY, JSON.stringify(serverBranding));
+    } catch (e) {}
+    return { branding: serverBranding, source: 'cloud' };
   }
 
   // 3. Fallback to Local Storage
@@ -2166,7 +2348,6 @@ export function saveStoredActiveLicense(license: LicenseToken | null) {
 }
 
 export async function fetchAdminContactFromCloud(): Promise<AdminContactConfig> {
-  // 1. Try local storage first
   let cached: AdminContactConfig = DEFAULT_ADMIN_CONTACT;
   try {
     const raw = localStorage.getItem(STORAGE_ADMIN_CONTACT_KEY);
@@ -2174,6 +2355,33 @@ export async function fetchAdminContactFromCloud(): Promise<AdminContactConfig> 
       cached = { ...DEFAULT_ADMIN_CONTACT, ...JSON.parse(raw) };
     }
   } catch (e) {}
+
+  // 1. Try Supabase Cloud first (Primary authority for GitHub Pages & all online users)
+  const supabase = initSupabase();
+  if (supabase) {
+    try {
+      let { data: d1 } = await supabase
+        .from('app_settings')
+        .select('value')
+        .eq('id', 'global_admin_contact')
+        .maybeSingle();
+
+      if (!d1?.value || typeof d1.value !== 'object') {
+        const res2 = await supabase
+          .from('app_settings')
+          .select('value')
+          .eq('id', 'admin_contact_config')
+          .maybeSingle();
+        d1 = res2.data;
+      }
+
+      if (d1?.value && typeof d1.value === 'object') {
+        cached = { ...DEFAULT_ADMIN_CONTACT, ...d1.value };
+        try { localStorage.setItem(STORAGE_ADMIN_CONTACT_KEY, JSON.stringify(cached)); } catch (e) {}
+        return cached;
+      }
+    } catch (e) {}
+  }
 
   // 2. Try Express server API
   try {
@@ -2187,36 +2395,6 @@ export async function fetchAdminContactFromCloud(): Promise<AdminContactConfig> 
       }
     }
   } catch (e) {}
-
-  // 3. Try Supabase
-  const supabase = initSupabase();
-  if (supabase) {
-    try {
-      const { data: d1 } = await supabase
-        .from('app_settings')
-        .select('value')
-        .eq('id', 'admin_contact_config')
-        .maybeSingle();
-
-      if (d1?.value && typeof d1.value === 'object') {
-        cached = { ...cached, ...d1.value };
-        try { localStorage.setItem(STORAGE_ADMIN_CONTACT_KEY, JSON.stringify(cached)); } catch (e) {}
-        return cached;
-      }
-
-      const { data: d2 } = await supabase
-        .from('solar_app_data')
-        .select('data')
-        .eq('key', 'admin_contact')
-        .maybeSingle();
-
-      if (d2?.data && typeof d2.data === 'object') {
-        cached = { ...cached, ...d2.data };
-        try { localStorage.setItem(STORAGE_ADMIN_CONTACT_KEY, JSON.stringify(cached)); } catch (e) {}
-        return cached;
-      }
-    } catch (e) {}
-  }
 
   return cached;
 }
@@ -2235,46 +2413,51 @@ export async function saveAdminContactToCloud(contact: AdminContactConfig): Prom
     });
   } catch (e) {}
 
-  // 2. Supabase Cloud (Store in app_settings and solar_app_data)
+  // 2. Cross-tab broadcast
+  if (typeof BroadcastChannel !== 'undefined') {
+    try {
+      const bc = new BroadcastChannel('solar_database_sync');
+      bc.postMessage({ type: 'ADMIN_CONTACT_UPDATED', contact, timestamp: Date.now() });
+      setTimeout(() => bc.close(), 1000);
+    } catch (e) {}
+  }
+
+  // 3. Supabase Cloud (Store in app_settings under both global_admin_contact and admin_contact_config)
   const supabase = initSupabase();
   if (supabase) {
     try {
+      const nowIso = new Date().toISOString();
       await supabase
         .from('app_settings')
-        .upsert({
-          id: 'admin_contact_config',
-          value: contact,
-          updated_at: new Date().toISOString()
-        }, { onConflict: 'id' });
+        .upsert([
+          { id: 'global_admin_contact', value: contact, updated_at: nowIso },
+          { id: 'admin_contact_config', value: contact, updated_at: nowIso }
+        ], { onConflict: 'id' });
     } catch (e) {}
 
-    try {
-      await supabase
-        .from('solar_app_data')
-        .upsert({
-          key: 'admin_contact',
-          data: contact,
-          updated_at: new Date().toISOString()
-        }, { onConflict: 'key' });
-    } catch (e) {}
-
-    // 3. Real-time broadcast
-    try {
-      const liveChannel = supabase.channel('solar_global_database_events');
-      liveChannel.subscribe((status: string) => {
-        if (status === 'SUBSCRIBED') {
-          liveChannel.send({
-            type: 'broadcast',
-            event: 'admin_contact_changed',
-            payload: { contact, timestamp: Date.now() }
-          });
-        }
-      });
-    } catch (e) {}
+    broadcastCloudEvent('admin_contact_changed', { contact, timestamp: Date.now() }).catch(() => {});
   }
 }
 
 export async function fetchLicensesFromCloud(): Promise<LicenseToken[]> {
+  // 1. Try Supabase Cloud `app_settings` (`global_licenses`) FIRST (works on GitHub Pages + multi-device)
+  const supabase = initSupabase();
+  if (supabase) {
+    try {
+      const { data, error } = await supabase
+        .from('app_settings')
+        .select('value')
+        .eq('id', 'global_licenses')
+        .maybeSingle();
+
+      if (!error && data?.value && Array.isArray(data.value)) {
+        try { localStorage.setItem(STORAGE_ALL_LICENSES_KEY, JSON.stringify(data.value)); } catch (e) {}
+        return data.value;
+      }
+    } catch (e) {}
+  }
+
+  // 2. Try Express server API
   try {
     const res = await fetch('/api/licenses');
     if (res.ok) {
@@ -2286,24 +2469,7 @@ export async function fetchLicensesFromCloud(): Promise<LicenseToken[]> {
     }
   } catch (e) {}
 
-  // Supabase fallback
-  const supabase = initSupabase();
-  if (supabase) {
-    try {
-      const { data, error } = await supabase
-        .from('solar_app_data')
-        .select('data')
-        .eq('key', 'licenses')
-        .maybeSingle();
-
-      if (!error && data?.data && Array.isArray(data.data)) {
-        try { localStorage.setItem(STORAGE_ALL_LICENSES_KEY, JSON.stringify(data.data)); } catch (e) {}
-        return data.data;
-      }
-    } catch (e) {}
-  }
-
-  // Local storage fallback
+  // 3. Local storage fallback
   try {
     const raw = localStorage.getItem(STORAGE_ALL_LICENSES_KEY);
     if (raw) return JSON.parse(raw);
@@ -2312,33 +2478,52 @@ export async function fetchLicensesFromCloud(): Promise<LicenseToken[]> {
   return [];
 }
 
-export async function saveLicensesToCloud(licenses: LicenseToken[]): Promise<void> {
+export async function saveLicensesToCloud(licenses: LicenseToken[]): Promise<{ success: boolean; error?: string }> {
   try {
     localStorage.setItem(STORAGE_ALL_LICENSES_KEY, JSON.stringify(licenses));
   } catch (e) {}
 
-  // Server API
-  try {
-    await fetch('/api/data/licenses', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ data: licenses })
-    });
-  } catch (e) {}
+  // 1. Broadcast across local browser tabs
+  if (typeof BroadcastChannel !== 'undefined') {
+    try {
+      const bc = new BroadcastChannel('solar_database_sync');
+      bc.postMessage({ type: 'LICENSES_UPDATED', licenses, timestamp: Date.now() });
+      setTimeout(() => bc.close(), 1000);
+    } catch (e) {}
+  }
 
-  // Supabase
+  // 2. Server API (non-blocking for GitHub Pages)
+  fetch('/api/data/licenses', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ data: licenses })
+  }).catch(() => {});
+
+  // 3. Supabase Cloud `app_settings` (`global_licenses`)
   const supabase = initSupabase();
   if (supabase) {
     try {
-      await supabase
-        .from('solar_app_data')
+      const { error } = await supabase
+        .from('app_settings')
         .upsert({
-          key: 'licenses',
-          data: licenses,
+          id: 'global_licenses',
+          value: licenses,
           updated_at: new Date().toISOString()
-        }, { onConflict: 'key' });
-    } catch (e) {}
+        }, { onConflict: 'id' });
+
+      if (error) {
+        console.warn('Supabase global_licenses save notice:', error.message);
+        return { success: false, error: error.message };
+      }
+
+      broadcastCloudEvent('licenses_changed', { licenses, timestamp: Date.now() }).catch(() => {});
+      return { success: true };
+    } catch (e: any) {
+      return { success: false, error: e?.message };
+    }
   }
+
+  return { success: true };
 }
 
 export async function generateLicenseOnServer(params: {
@@ -2347,6 +2532,8 @@ export async function generateLicenseOnServer(params: {
   deviceLimit: 1 | 2;
   note?: string;
 }): Promise<{ success: boolean; license?: LicenseToken; error?: string }> {
+  let createdLicense: LicenseToken | null = null;
+
   try {
     const res = await fetch('/api/license/generate', {
       method: 'POST',
@@ -2356,53 +2543,52 @@ export async function generateLicenseOnServer(params: {
     if (res.ok) {
       const json = await res.json();
       if (json.success && json.license) {
-        // Also sync to Supabase
-        const currentLicenses = await fetchLicensesFromCloud();
-        const updated = [json.license, ...currentLicenses.filter(l => l.id !== json.license.id)];
-        await saveLicensesToCloud(updated);
-        return { success: true, license: json.license };
+        createdLicense = json.license;
       }
     }
   } catch (e) {}
 
-  // Fallback client generation if server route fails
-  const d = params.duration || '1_month';
-  let days = 30;
-  if (d === '1_week') days = 7;
-  else if (d === '1_month') days = 30;
-  else if (d === '3_months') days = 90;
-  else if (d === '6_months') days = 180;
-  else if (d === '1_year') days = 365;
-  else if (d === 'lifetime') days = 3650;
+  // Fallback client generation if server route is not reachable (e.g. Admin on GitHub Pages)
+  if (!createdLicense) {
+    const d = params.duration || '1_month';
+    let days = 30;
+    if (d === '1_week') days = 7;
+    else if (d === '1_month') days = 30;
+    else if (d === '3_months') days = 90;
+    else if (d === '6_months') days = 180;
+    else if (d === '1_year') days = 365;
+    else if (d === 'lifetime') days = 3650;
 
-  const rand1 = Math.random().toString(36).substring(2, 6).toUpperCase();
-  const rand2 = Math.random().toString(36).substring(2, 6).toUpperCase();
-  const durCode = d === '1_week' ? '1W' : d === '1_month' ? '1M' : d === '3_months' ? '3M' : d === '6_months' ? '6M' : d === '1_year' ? '1Y' : 'LIFE';
-  const devCode = params.deviceLimit === 2 ? '2D' : '1D';
-  const token = `SOLAR-PRO-${durCode}-${devCode}-${rand1}-${rand2}`;
+    const rand1 = Math.random().toString(36).substring(2, 6).toUpperCase();
+    const rand2 = Math.random().toString(36).substring(2, 6).toUpperCase();
+    const durCode = d === '1_week' ? '1W' : d === '1_month' ? '1M' : d === '3_months' ? '3M' : d === '6_months' ? '6M' : d === '1_year' ? '1Y' : 'LIFE';
+    const devCode = params.deviceLimit === 2 ? '2D' : '1D';
+    const token = `SOLAR-PRO-${durCode}-${devCode}-${rand1}-${rand2}`;
 
-  const now = new Date();
-  const expires = new Date(now.getTime() + days * 86400000);
+    const now = new Date();
+    const expires = new Date(now.getTime() + days * 86400000);
 
-  const fallbackLicense: LicenseToken = {
-    id: `lic_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-    token,
-    customerName: params.customerName.trim() || 'Engineer Customer',
-    duration: d,
-    durationDays: days,
-    deviceLimit: params.deviceLimit === 2 ? 2 : 1,
-    boundDevices: [],
-    createdAt: now.toISOString(),
-    expiresAt: expires.toISOString(),
-    status: 'active',
-    note: params.note || ''
-  };
+    createdLicense = {
+      id: `lic_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      token,
+      customerName: params.customerName.trim() || 'Engineer Customer',
+      duration: d,
+      durationDays: days,
+      deviceLimit: params.deviceLimit === 2 ? 2 : 1,
+      boundDevices: [],
+      createdAt: now.toISOString(),
+      expiresAt: expires.toISOString(),
+      status: 'active',
+      note: params.note || ''
+    };
+  }
 
-  const current = await fetchLicensesFromCloud();
-  const updated = [fallbackLicense, ...current];
+  // Always sync to Supabase `global_licenses` so all online devices see it immediately!
+  const currentLicenses = await fetchLicensesFromCloud();
+  const updated = [createdLicense, ...currentLicenses.filter(l => l.id !== createdLicense!.id && l.token !== createdLicense!.token)];
   await saveLicensesToCloud(updated);
 
-  return { success: true, license: fallbackLicense };
+  return { success: true, license: createdLicense };
 }
 
 export async function activateLicenseOnDevice(token: string): Promise<{
@@ -2415,6 +2601,94 @@ export async function activateLicenseOnDevice(token: string): Promise<{
   const deviceModel = getClientDevice();
   const cleaned = token.trim().toUpperCase();
 
+  // 1. Primary Cloud Validation via Supabase `global_licenses` (works 100% online on GitHub Pages without VPN!)
+  const supabase = initSupabase();
+  if (supabase) {
+    try {
+      const { data, error } = await supabase
+        .from('app_settings')
+        .select('value')
+        .eq('id', 'global_licenses')
+        .maybeSingle();
+
+      if (!error && Array.isArray(data?.value)) {
+        const list: LicenseToken[] = [...data.value];
+        const licIndex = list.findIndex(l =>
+          l.token.toUpperCase() === cleaned ||
+          l.id === cleaned ||
+          cleaned.includes(l.token.toUpperCase())
+        );
+
+        if (licIndex !== -1) {
+          const lic = { ...list[licIndex] };
+
+          if (lic.status === 'revoked') {
+            return {
+              success: false,
+              error: 'revoked',
+              message: 'ဤလိုင်စင်ကို Admin မှ ပိတ်ထားပါသည် (License Revoked)'
+            };
+          }
+
+          if (new Date(lic.expiresAt).getTime() < Date.now() || lic.status === 'expired') {
+            lic.status = 'expired';
+            list[licIndex] = lic;
+            await saveLicensesToCloud(list);
+            return {
+              success: false,
+              error: 'expired',
+              message: 'ဤလိုင်စင် သက်တမ်းကုန်ဆုံးသွားပါပြီ။ သက်တမ်းတိုးရန် Admin အား ဆက်သွယ်ပါ (License Expired)'
+            };
+          }
+
+          const bound = Array.isArray(lic.boundDevices) ? [...lic.boundDevices] : [];
+          const existingIdx = bound.findIndex(b => b.deviceId === deviceId);
+
+          if (existingIdx !== -1) {
+            bound[existingIdx] = {
+              ...bound[existingIdx],
+              deviceModel,
+              lastSeenAt: new Date().toISOString()
+            };
+            lic.boundDevices = bound;
+            list[licIndex] = lic;
+            await saveLicensesToCloud(list);
+            saveStoredActiveLicense(lic);
+            return { success: true, license: lic };
+          }
+
+          if (bound.length >= (lic.deviceLimit || 1)) {
+            return {
+              success: false,
+              error: 'device_limit_exceeded',
+              message: `ခွင့်ပြုထားသည့် စက်အရေအတွက် (${lic.deviceLimit} လုံး) ပြည့်သွားပါပြီ။ အခြားစက်တွင် အသုံးပြုလိုပါက Admin ထံ ဆက်သွယ်ပါ။`
+            };
+          }
+
+          bound.push({
+            deviceId,
+            deviceModel,
+            activatedAt: new Date().toISOString(),
+            lastSeenAt: new Date().toISOString()
+          });
+          lic.boundDevices = bound;
+          list[licIndex] = lic;
+          await saveLicensesToCloud(list);
+          saveStoredActiveLicense(lic);
+
+          notifyTelegramOnClientActivation(lic, deviceModel, deviceId).catch(() => {});
+
+          return {
+            success: true,
+            license: lic,
+            message: '🎉 PRO License အောင်မြင်စွာ ဖွင့်ပြီးပါပြီ! (Online Real-Time Synced)'
+          };
+        }
+      }
+    } catch (cloudErr) {}
+  }
+
+  // 2. Try Express Server API (if running on local/hosted backend)
   try {
     const res = await fetch('/api/license/activate', {
       method: 'POST',
@@ -2422,103 +2696,112 @@ export async function activateLicenseOnDevice(token: string): Promise<{
       body: JSON.stringify({ token: cleaned, deviceId, deviceModel }),
       signal: AbortSignal.timeout(5000)
     });
-    const json = await res.json();
-    if (json.success && json.license) {
-      saveStoredActiveLicense(json.license);
-      return { success: true, license: json.license };
-    } else {
-      return {
-        success: false,
-        error: json.error || 'activation_failed',
-        message: json.message || 'လိုင်စင်ဖွင့်ခြင်း မအောင်မြင်ပါ'
-      };
-    }
-  } catch (e) {
-    // OFFLINE & VPN-FREE FALLBACK ACTIVATION:
-    // When device has no VPN or server cannot be reached, evaluate token locally!
-    const tokenRegex = /^SOLAR-PRO-(1W|1M|3M|6M|1Y|LIFE)-(1D|2D)-[A-Z0-9]{4}-[A-Z0-9]{4}$/i;
-    const match = cleaned.match(tokenRegex);
-
-    if (match) {
-      const durCode = match[1].toUpperCase();
-      const devCode = match[2].toUpperCase();
-
-      let days = 30;
-      let durationStr: any = '1_month';
-      if (durCode === '1W') { days = 7; durationStr = '1_week'; }
-      else if (durCode === '1M') { days = 30; durationStr = '1_month'; }
-      else if (durCode === '3M') { days = 90; durationStr = '3_months'; }
-      else if (durCode === '6M') { days = 180; durationStr = '6_months'; }
-      else if (durCode === '1Y') { days = 365; durationStr = '1_year'; }
-      else if (durCode === 'LIFE') { days = 3650; durationStr = 'lifetime'; }
-
-      const devLimit = devCode === '2D' ? 2 : 1;
-
-      const offlineLicense: LicenseToken = {
-        id: `lic_offline_${Date.now()}`,
-        token: cleaned,
-        customerName: 'Valued Pro Engineer',
-        duration: durationStr,
-        durationDays: days,
-        deviceLimit: devLimit,
-        boundDevices: [{
-          deviceId,
-          deviceModel,
-          activatedAt: new Date().toISOString(),
-          lastSeenAt: new Date().toISOString()
-        }],
-        createdAt: new Date().toISOString(),
-        expiresAt: new Date(Date.now() + days * 86400000).toISOString(),
-        status: 'active',
-        note: 'Offline / VPN-Free Direct Activation'
-      };
-
-      saveStoredActiveLicense(offlineLicense);
-
-      // Real-time Telegram notification to Admin when user activates on GitHub Pages
-      notifyTelegramOnClientActivation(offlineLicense, deviceModel, deviceId).catch(() => {});
-
-      return {
-        success: true,
-        license: offlineLicense,
-        message: '🎉 PRO License အောင်မြင်စွာ ဖွင့်ပြီးပါပြီ! (VPN မလိုဘဲ အသုံးပြုနိုင်ပါပြီ)'
-      };
-    }
-
-    // Check local cached licenses list
-    try {
-      const cachedRaw = localStorage.getItem(STORAGE_ALL_LICENSES_KEY);
-      if (cachedRaw) {
-        const cachedList: LicenseToken[] = JSON.parse(cachedRaw);
-        const found = cachedList.find(l => l.token.toUpperCase() === cleaned || l.id === cleaned);
-        if (found) {
-          saveStoredActiveLicense(found);
-          return { success: true, license: found };
-        }
+    const contentType = res.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+      const json = await res.json();
+      if (json.success && json.license) {
+        saveStoredActiveLicense(json.license);
+        // Ensure Supabase global_licenses is also up-to-date
+        const current = await fetchLicensesFromCloud();
+        const merged = [json.license, ...current.filter(l => l.token !== json.license.token)];
+        saveLicensesToCloud(merged).catch(() => {});
+        return { success: true, license: json.license };
+      } else if (json.error === 'revoked' || json.error === 'expired' || json.error === 'device_limit_exceeded') {
+        return {
+          success: false,
+          error: json.error,
+          message: json.message || 'လိုင်စင်ဖွင့်ခြင်း မအောင်မြင်ပါ'
+        };
       }
-    } catch (err) {}
+    }
+  } catch (e) {}
+
+  // 3. OFFLINE & VPN-FREE FALLBACK ACTIVATION (for valid format tokens generated offline or before sync):
+  const tokenRegex = /^SOLAR-PRO-(1W|1M|3M|6M|1Y|LIFE)-(1D|2D)-[A-Z0-9]{4}-[A-Z0-9]{4}$/i;
+  const match = cleaned.match(tokenRegex);
+
+  if (match) {
+    const durCode = match[1].toUpperCase();
+    const devCode = match[2].toUpperCase();
+
+    let days = 30;
+    let durationStr: LicenseToken['duration'] = '1_month';
+    if (durCode === '1W') { days = 7; durationStr = '1_week'; }
+    else if (durCode === '1M') { days = 30; durationStr = '1_month'; }
+    else if (durCode === '3M') { days = 90; durationStr = '3_months'; }
+    else if (durCode === '6M') { days = 180; durationStr = '6_months'; }
+    else if (durCode === '1Y') { days = 365; durationStr = '1_year'; }
+    else if (durCode === 'LIFE') { days = 3650; durationStr = 'lifetime'; }
+
+    const devLimit: 1 | 2 = devCode === '2D' ? 2 : 1;
+
+    const offlineLicense: LicenseToken = {
+      id: `lic_offline_${Date.now()}`,
+      token: cleaned,
+      customerName: 'Valued Pro Engineer',
+      duration: durationStr,
+      durationDays: days,
+      deviceLimit: devLimit,
+      boundDevices: [{
+        deviceId,
+        deviceModel,
+        activatedAt: new Date().toISOString(),
+        lastSeenAt: new Date().toISOString()
+      }],
+      createdAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + days * 86400000).toISOString(),
+      status: 'active',
+      note: 'Direct Activation (Auto-Synced to Cloud)'
+    };
+
+    saveStoredActiveLicense(offlineLicense);
+
+    // Auto-register into Supabase global_licenses if online so Admin can manage it live
+    if (supabase) {
+      fetchLicensesFromCloud().then(existing => {
+        if (!existing.some(l => l.token.toUpperCase() === cleaned)) {
+          saveLicensesToCloud([offlineLicense, ...existing]).catch(() => {});
+        }
+      }).catch(() => {});
+    }
+
+    // Real-time Telegram notification to Admin when user activates on GitHub Pages
+    notifyTelegramOnClientActivation(offlineLicense, deviceModel, deviceId).catch(() => {});
 
     return {
-      success: false,
-      error: 'invalid_token',
-      message: 'လိုင်စင်ကုဒ် မှားယွင်းနေပါသည်။ (ဥပမာ ပုံစံ: SOLAR-PRO-1M-1D-XXXX-YYYY)'
+      success: true,
+      license: offlineLicense,
+      message: '🎉 PRO License အောင်မြင်စွာ ဖွင့်ပြီးပါပြီ! (VPN မလိုဘဲ အသုံးပြုနိုင်ပါပြီ)'
     };
   }
+
+  // 4. Check local cached licenses list
+  try {
+    const cachedRaw = localStorage.getItem(STORAGE_ALL_LICENSES_KEY);
+    if (cachedRaw) {
+      const cachedList: LicenseToken[] = JSON.parse(cachedRaw);
+      const found = cachedList.find(l => l.token.toUpperCase() === cleaned || l.id === cleaned);
+      if (found && found.status === 'active' && new Date(found.expiresAt).getTime() > Date.now()) {
+        saveStoredActiveLicense(found);
+        return { success: true, license: found };
+      }
+    }
+  } catch (err) {}
+
+  return {
+    success: false,
+    error: 'invalid_token',
+    message: 'လိုင်စင်ကုဒ် မှားယွင်းနေပါသည်။ (ဥပမာ ပုံစံ: SOLAR-PRO-1M-1D-XXXX-YYYY)'
+  };
 }
 
 export async function unbindLicenseDevice(licenseId: string, deviceId?: string): Promise<{ success: boolean; license?: LicenseToken }> {
   try {
-    const res = await fetch('/api/license/unbind-device', {
+    await fetch('/api/license/unbind-device', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ licenseId, deviceId: deviceId || 'all' })
     });
-    if (res.ok) {
-      const json = await res.json();
-      if (json.success) {
-        return { success: true, license: json.license };
-      }
-    }
   } catch (e) {}
 
   const licenses = await fetchLicensesFromCloud();
@@ -2537,15 +2820,11 @@ export async function unbindLicenseDevice(licenseId: string, deviceId?: string):
 
 export async function extendLicenseDuration(licenseId: string, days: number = 30): Promise<{ success: boolean; license?: LicenseToken }> {
   try {
-    const res = await fetch('/api/license/extend', {
+    await fetch('/api/license/extend', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ licenseId, days })
     });
-    if (res.ok) {
-      const json = await res.json();
-      if (json.success) return { success: true, license: json.license };
-    }
   } catch (e) {}
 
   const licenses = await fetchLicensesFromCloud();
@@ -2563,15 +2842,11 @@ export async function extendLicenseDuration(licenseId: string, days: number = 30
 
 export async function updateLicenseStatus(licenseId: string, status: LicenseToken['status']): Promise<{ success: boolean; license?: LicenseToken }> {
   try {
-    const res = await fetch('/api/license/status', {
+    await fetch('/api/license/status', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ licenseId, status })
     });
-    if (res.ok) {
-      const json = await res.json();
-      if (json.success) return { success: true, license: json.license };
-    }
   } catch (e) {}
 
   const licenses = await fetchLicensesFromCloud();
@@ -2606,12 +2881,15 @@ export async function publishLiveSystemUpdate(
     adminContact?: AdminContactConfig;
     adminResources?: AdminResourceFile[];
     appBranding?: AppBranding;
+    licenses?: LicenseToken[];
+    paymentConfig?: any;
   }
-): Promise<{ success: boolean; publishedAt?: string }> {
+): Promise<{ success: boolean; publishedAt?: string; error?: string }> {
   const publishedAt = new Date().toISOString();
   const publishNote = note || "Admin published live update";
+  let cloudError: string | undefined;
 
-  // 1. Persist ALL equipment datasets to Supabase Cloud so GitHub Pages clients load them immediately
+  // 1. Persist ALL equipment datasets, files, branding, contacts, and licenses to Supabase Cloud
   const supabase = initSupabase();
   if (supabase) {
     try {
@@ -2642,52 +2920,66 @@ export async function publishLiveSystemUpdate(
         upsertRows.push({ id: 'global_mounting_database', value: extraPayload.mountingDatabase, updated_at: publishedAt });
       }
       if (extraPayload?.adminContact) {
-        upsertRows.push({ id: 'global_admin_contact', value: extraPayload.adminContact, updated_at: publishedAt });
+        upsertRows.push(
+          { id: 'global_admin_contact', value: extraPayload.adminContact, updated_at: publishedAt },
+          { id: 'admin_contact_config', value: extraPayload.adminContact, updated_at: publishedAt }
+        );
       }
       if (extraPayload?.appBranding) {
         upsertRows.push({ id: 'global_app_branding', value: extraPayload.appBranding, updated_at: publishedAt });
       }
+      if (extraPayload?.paymentConfig) {
+        upsertRows.push({ id: 'global_payment_config', value: extraPayload.paymentConfig, updated_at: publishedAt });
+      }
+      if (extraPayload?.licenses && Array.isArray(extraPayload.licenses)) {
+        upsertRows.push({ id: 'global_licenses', value: extraPayload.licenses, updated_at: publishedAt });
+      }
       if (extraPayload?.adminResources && Array.isArray(extraPayload.adminResources)) {
+        // Upload any inline binary file data to dedicated `resource_file_<id>` rows first
+        for (const res of extraPayload.adminResources) {
+          if (res.fileData && res.fileData.startsWith('data:')) {
+            try {
+              await supabase
+                .from('app_settings')
+                .upsert({
+                  id: `resource_file_${res.id}`,
+                  value: {
+                    id: res.id,
+                    fileName: res.fileName,
+                    fileType: res.fileType,
+                    fileData: res.fileData
+                  },
+                  updated_at: publishedAt
+                }, { onConflict: 'id' });
+            } catch (e) {}
+          }
+        }
         const sanitized = sanitizeResourcesForLocalCache(extraPayload.adminResources);
         upsertRows.push({ id: 'global_admin_resources', value: sanitized, updated_at: publishedAt });
       }
 
-      await supabase
+      const { error } = await supabase
         .from('app_settings')
         .upsert(upsertRows, { onConflict: 'id' });
 
-      // Broadcast full payload across Supabase Realtime for instant update on all open GitHub tabs
-      const channel = supabase.channel('solar_global_database_events');
-      channel.subscribe((status: string) => {
-        if (status === 'SUBSCRIBED') {
-          channel.send({
-            type: 'broadcast',
-            event: 'system_published',
-            payload: {
-              publishedAt,
-              note: publishNote,
-              timestamp: publishedAt,
-              ...extraPayload
-            }
-          });
-          if (extraPayload?.inverters) {
-            channel.send({
-              type: 'broadcast',
-              event: 'inverters_changed',
-              payload: { inverters: extraPayload.inverters, count: extraPayload.inverters.length, timestamp: Date.now() }
-            });
-          }
-          if (extraPayload?.panels) {
-            channel.send({
-              type: 'broadcast',
-              event: 'panels_changed',
-              payload: { panels: extraPayload.panels, count: extraPayload.panels.length, timestamp: Date.now() }
-            });
-          }
-          setTimeout(() => channel.unsubscribe(), 2500);
-        }
-      });
-    } catch (e) {
+      if (error) {
+        cloudError = error.message;
+        console.warn('Supabase publish update error:', error.message);
+      }
+
+      // Broadcast sanitized payload across Supabase Realtime for instant update on all open GitHub tabs
+      const sanitizedPayload = {
+        publishedAt,
+        note: publishNote,
+        timestamp: publishedAt,
+        ...extraPayload,
+        adminResources: extraPayload?.adminResources
+          ? sanitizeResourcesForLocalCache(extraPayload.adminResources)
+          : undefined
+      };
+      broadcastCloudEvent('system_published', sanitizedPayload).catch(() => {});
+    } catch (e: any) {
+      cloudError = e?.message;
       console.warn('Supabase publish update error:', e);
     }
   }
@@ -2700,12 +2992,15 @@ export async function publishLiveSystemUpdate(
       body: JSON.stringify({ note: publishNote, ...extraPayload })
     });
     if (res.ok) {
-      const json = await res.json();
-      return { success: true, publishedAt: json.publishedAt || publishedAt };
+      const contentType = res.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        const json = await res.json();
+        return { success: !cloudError, publishedAt: json.publishedAt || publishedAt, error: cloudError };
+      }
     }
   } catch (e) {}
 
-  return { success: true, publishedAt };
+  return { success: !cloudError, publishedAt, error: cloudError };
 }
 
 // ----------------------------------------------------

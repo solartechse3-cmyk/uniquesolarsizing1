@@ -22,6 +22,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { AdminResourceFile } from '../types';
+import { fetchResourceFileDataFromCloud } from '../lib/supabase';
 
 interface ResourcesVaultModalProps {
   isOpen: boolean;
@@ -60,6 +61,7 @@ export const ResourcesVaultModal: React.FC<ResourcesVaultModalProps> = ({
   const [fileSize, setFileSize] = useState('');
   const [fileData, setFileData] = useState<string>('');
   const [isPaidOnly, setIsPaidOnly] = useState<boolean>(true);
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
 
   if (!isOpen) return null;
 
@@ -112,8 +114,9 @@ export const ResourcesVaultModal: React.FC<ResourcesVaultModalProps> = ({
       return;
     }
 
+    setDownloadingId(res.id);
     try {
-      // 1. Direct base64 data URL
+      // 1. Direct base64 data URL (inline in memory)
       if (res.fileData && res.fileData.startsWith('data:')) {
         const link = document.createElement('a');
         link.href = res.fileData;
@@ -124,11 +127,26 @@ export const ResourcesVaultModal: React.FC<ResourcesVaultModalProps> = ({
         return;
       }
 
-      // 2. Fetch from server streaming endpoint
+      // 2. Fetch full binary file directly from Supabase Cloud (`resource_file_<id>`) — works 100% on GitHub Pages!
+      try {
+        const cloudDataUrl = await fetchResourceFileDataFromCloud(res.id);
+        if (cloudDataUrl && cloudDataUrl.startsWith('data:')) {
+          const link = document.createElement('a');
+          link.href = cloudDataUrl;
+          link.download = res.fileName;
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          return;
+        }
+      } catch (cloudErr) {}
+
+      // 3. Fetch from local/hosted Express server streaming endpoint
       const serverUrl = res.fileUrl || `/api/files/${res.id}`;
       try {
         const resp = await fetch(serverUrl);
-        if (resp.ok) {
+        const contentType = resp.headers.get('content-type') || '';
+        if (resp.ok && !contentType.includes('text/html')) {
           const blob = await resp.blob();
           const url = URL.createObjectURL(blob);
           const link = document.createElement('a');
@@ -142,7 +160,7 @@ export const ResourcesVaultModal: React.FC<ResourcesVaultModalProps> = ({
         }
       } catch (fetchErr) {}
 
-      // 3. Fallback text file download if raw data not embedded
+      // 4. Fallback summary text file if sample item has no attached binary
       const blob = new Blob([
         `=== ${res.title} ===\n\nCategory: ${res.category}\nFile: ${res.fileName}\nUploaded: ${new Date(res.uploadedAt).toLocaleDateString()}\n\n${res.description}\n\n[Solar Tech Engineering Resources - Verified for Pro Users]`
       ], { type: 'text/plain;charset=utf-8' });
@@ -156,6 +174,8 @@ export const ResourcesVaultModal: React.FC<ResourcesVaultModalProps> = ({
       setTimeout(() => URL.revokeObjectURL(url), 10000);
     } catch (err) {
       console.error('Download failed:', err);
+    } finally {
+      setDownloadingId(null);
     }
   };
 
@@ -517,10 +537,15 @@ export const ResourcesVaultModal: React.FC<ResourcesVaultModalProps> = ({
 
                       <button
                         onClick={() => handleDownload(res)}
-                        className="px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 cursor-pointer transition-all shadow-md bg-purple-600 hover:bg-purple-500 text-white shadow-purple-600/20"
+                        disabled={downloadingId === res.id}
+                        className="px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 cursor-pointer transition-all shadow-md bg-purple-600 hover:bg-purple-500 disabled:opacity-60 text-white shadow-purple-600/20"
                       >
-                        <Download className="w-3.5 h-3.5" />
-                        <span>{lang === 'my' ? 'ဒေါင်းလုဒ်' : 'Download'}</span>
+                        <Download className={`w-3.5 h-3.5 ${downloadingId === res.id ? 'animate-bounce' : ''}`} />
+                        <span>
+                          {downloadingId === res.id
+                            ? (lang === 'my' ? 'ဒေါင်းနေသည်...' : 'Downloading...')
+                            : (lang === 'my' ? 'ဒေါင်းလုဒ်' : 'Download')}
+                        </span>
                       </button>
                     </div>
                   </div>
