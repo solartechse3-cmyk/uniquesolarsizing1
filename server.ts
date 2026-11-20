@@ -1170,9 +1170,172 @@ async function autoSyncLicenseToGoogleSheet(lic: any) {
   }
 }
 
+function normalizeMyanmarDigits(str: string): string {
+  return String(str || '').replace(/[၀-၉]/g, ch => String(ch.charCodeAt(0) - 0x1040));
+}
+
+function parseDurationToken(
+  raw?: string
+): '1_week' | '1_month' | '3_months' | '6_months' | '1_year' | 'lifetime' | null {
+  const cleaned = normalizeMyanmarDigits(raw || '')
+    .trim()
+    .replace(/^[,.:;]+|[,.:;]+$/g, '')
+    .toLowerCase()
+    .replace(/[\s_\-]+/g, '');
+  if (!cleaned) return null;
+
+  if ([
+    '1w', '1wk', '1wks', 'week', '1week', '1weeks',
+    '7d', '7day', '7days', '1ပတ်', 'ပတ်', '7ရက်'
+  ].includes(cleaned)) {
+    return '1_week';
+  }
+  if ([
+    '1m', '1mo', '1mon', '1mons', 'month', '1month', '1months',
+    '30d', '30day', '30days', '1လ', '30ရက်'
+  ].includes(cleaned)) {
+    return '1_month';
+  }
+  if ([
+    '3m', '3mo', '3mon', '3mons', '3month', '3months',
+    '90d', '90day', '90days', '3လ', '90ရက်'
+  ].includes(cleaned)) {
+    return '3_months';
+  }
+  if ([
+    '6m', '6mo', '6mon', '6mons', '6month', '6months',
+    '180d', '180day', '180days', '6လ', '180ရက်'
+  ].includes(cleaned)) {
+    return '6_months';
+  }
+  if ([
+    '1y', '1yr', '1yrs', 'year', '1year', '1years',
+    '12m', '12mo', '12mon', '12month', '12months',
+    '365d', '365day', '365days', '1နှစ်', 'နှစ်', '12လ', '365ရက်'
+  ].includes(cleaned)) {
+    return '1_year';
+  }
+  if ([
+    'life', 'lifetime', 'forever', 'unlimited', 'perm', 'permanent',
+    '10y', '10yr', '10year', '10years', 'တစ်သက်တာ'
+  ].includes(cleaned)) {
+    return 'lifetime';
+  }
+  return null;
+}
+
+function parseDeviceLimitToken(raw?: string, allowBareNumber: boolean = true): 1 | 2 | null {
+  const cleaned = normalizeMyanmarDigits(raw || '')
+    .trim()
+    .replace(/^[,.:;]+|[,.:;]+$/g, '')
+    .toLowerCase()
+    .replace(/[\s_\-]+/g, '');
+  if (!cleaned) return null;
+  if (['1d', '1dev', '1device', '1devices', '1လုံး'].includes(cleaned)) return 1;
+  if (['2d', '2dev', '2device', '2devices', '2လုံး'].includes(cleaned)) return 2;
+  if (allowBareNumber && cleaned === '1') return 1;
+  if (allowBareNumber && cleaned === '2') return 2;
+  return null;
+}
+
+function parseTelegramGenArgs(
+  rawArgs: string[],
+  fixedDuration?: '1_week' | '1_month' | '3_months' | '6_months' | '1_year' | 'lifetime'
+): {
+  customerName: string;
+  duration: '1_week' | '1_month' | '3_months' | '6_months' | '1_year' | 'lifetime' | null;
+  deviceLimit: 1 | 2;
+} {
+  // Merge adjacent number + unit pairs (e.g. ["1", "week"] -> ["1week"], ["2", "devices"] -> ["2devices"])
+  const tokens: string[] = [];
+  for (let i = 0; i < rawArgs.length; i++) {
+    const cur = rawArgs[i];
+    const next = rawArgs[i + 1];
+    if (cur && next) {
+      const curNorm = normalizeMyanmarDigits(cur).trim().replace(/^[,.:;]+|[,.:;]+$/g, '').toLowerCase();
+      const nextNorm = normalizeMyanmarDigits(next).trim().replace(/^[,.:;]+|[,.:;]+$/g, '').toLowerCase();
+      const isNum = /^\d+$/.test(curNorm);
+      const isDurUnit = [
+        'w', 'wk', 'wks', 'week', 'weeks',
+        'm', 'mo', 'mon', 'mons', 'month', 'months',
+        'y', 'yr', 'yrs', 'year', 'years',
+        'day', 'days', 'ပတ်', 'လ', 'နှစ်', 'ရက်'
+      ].includes(nextNorm) || (nextNorm === 'd' && ['7', '30', '90', '180', '365'].includes(curNorm));
+      const isDevUnit = ['dev', 'device', 'devices', 'လုံး'].includes(nextNorm)
+        || (nextNorm === 'd' && ['1', '2'].includes(curNorm));
+      if (isNum && (isDurUnit || isDevUnit)) {
+        tokens.push(`${curNorm}${nextNorm}`);
+        i++;
+        continue;
+      }
+    }
+    tokens.push(cur);
+  }
+
+  let duration: '1_week' | '1_month' | '3_months' | '6_months' | '1_year' | 'lifetime' | null = fixedDuration || null;
+  let durIdx = -1;
+
+  // Scan RIGHT-TO-LEFT for duration token so multi-word customer names (e.g. "Ko Aung 1w 1") parse accurately
+  if (!duration) {
+    for (let i = tokens.length - 1; i >= 0; i--) {
+      const parsed = parseDurationToken(tokens[i]);
+      if (parsed) {
+        duration = parsed;
+        durIdx = i;
+        break;
+      }
+    }
+  }
+
+  let deviceLimit: 1 | 2 = 1;
+  let devIdx = -1;
+
+  // Check token right after duration (e.g. "/gen Ko Aung 1w 2" or "/gen 1w 2 Ko Aung")
+  if (durIdx !== -1 && durIdx + 1 < tokens.length) {
+    const afterDur = parseDeviceLimitToken(tokens[durIdx + 1], true);
+    if (afterDur !== null) {
+      deviceLimit = afterDur;
+      devIdx = durIdx + 1;
+    }
+  }
+
+  // Otherwise check the trailing token (e.g. "/1w Ko Aung 2" or "/gen 1w Ko Aung 2")
+  if (devIdx === -1 && tokens.length > 0) {
+    const lastIdx = tokens.length - 1;
+    if (lastIdx !== durIdx) {
+      const lastDev = parseDeviceLimitToken(tokens[lastIdx], true);
+      if (lastDev !== null) {
+        deviceLimit = lastDev;
+        devIdx = lastIdx;
+      }
+    }
+  }
+
+  // Also check for any explicitly labeled device token anywhere (e.g. "2d", "2devices")
+  if (devIdx === -1) {
+    for (let i = tokens.length - 1; i >= 0; i--) {
+      if (i === durIdx) continue;
+      const explicitDev = parseDeviceLimitToken(tokens[i], false);
+      if (explicitDev !== null) {
+        deviceLimit = explicitDev;
+        devIdx = i;
+        break;
+      }
+    }
+  }
+
+  const nameTokens = tokens
+    .filter((_, idx) => idx !== durIdx && idx !== devIdx)
+    .map(t => t.replace(/^,+|,+$/g, ''))
+    .filter(Boolean);
+  const customerName = nameTokens.join(' ').trim();
+
+  return { customerName, duration, deviceLimit };
+}
+
 // Helper to generate a new PRO License Record (used by Web UI, API, and Telegram Bot)
 function generateLicenseRecord(customerName: string, duration?: string, deviceLimit: number = 1, note?: string) {
-  const d = duration || '1_month';
+  const d = parseDurationToken(duration) || '1_month';
   let days = 30;
   if (d === '1_week') days = 7;
   else if (d === '1_month') days = 30;
@@ -1181,8 +1344,8 @@ function generateLicenseRecord(customerName: string, duration?: string, deviceLi
   else if (d === '1_year') days = 365;
   else if (d === 'lifetime') days = 3650;
 
-  const rand1 = Math.random().toString(36).substring(2, 6).toUpperCase();
-  const rand2 = Math.random().toString(36).substring(2, 6).toUpperCase();
+  const rand1 = (Math.random().toString(36).substring(2, 6) + 'ABCD').substring(0, 4).toUpperCase();
+  const rand2 = (Math.random().toString(36).substring(2, 6) + 'WXYZ').substring(0, 4).toUpperCase();
   const durCode = d === '1_week' ? '1W' : d === '1_month' ? '1M' : d === '3_months' ? '3M' : d === '6_months' ? '6M' : d === '1_year' ? '1Y' : 'LIFE';
   const devCode = deviceLimit === 2 ? '2D' : '1D';
   const token = `SOLAR-PRO-${durCode}-${devCode}-${rand1}-${rand2}`;
@@ -1533,12 +1696,16 @@ async function syncTelegramBotProfileAndMenu(token: string, appUrl: string) {
       body: JSON.stringify({
         commands: [
           { command: 'start', description: 'Open App & Usage Guide' },
-          { command: 'app', description: 'Open Unique Solar Pro on GitHub Pages' },
-          { command: 'gen', description: '[Admin] /gen <name> <duration> [devices]' },
+          { command: 'gen', description: '[Admin] /gen <name> <1w|1m|3m|6m|1y|life> [1|2]' },
+          { command: '1w', description: '[Admin] Quick 1 Week key (/1w <name> [1|2])' },
+          { command: '1m', description: '[Admin] Quick 1 Month key (/1m <name> [1|2])' },
+          { command: '3m', description: '[Admin] Quick 3 Months key (/3m <name> [1|2])' },
+          { command: '6m', description: '[Admin] Quick 6 Months key (/6m <name> [1|2])' },
+          { command: '1y', description: '[Admin] Quick 1 Year key (/1y <name> [1|2])' },
           { command: 'licenses', description: '[Admin] View recent licenses' },
           { command: 'csv', description: '[Admin] Download license Excel / CSV' },
           { command: 'stats', description: '[Admin] Total licenses & bound devices' },
-          { command: 'id', description: 'View Telegram Chat ID' },
+          { command: 'app', description: 'Open Unique Solar Pro on GitHub Pages' },
           { command: 'help', description: 'Commands cheat sheet' }
         ]
       }),
@@ -1649,6 +1816,124 @@ let isPollingFetchInProgress = false;
 let pollingAbortController: AbortController | null = null;
 const processedUpdateIds = new Set<number>();
 const recentCommandCache = new Map<string, { time: number; license: any }>();
+const pendingGenPrompts = new Map<string, { customerName: string; deviceLimit: 1 | 2; createdAt: number }>();
+
+async function answerTelegramCallbackQuery(token: string, callbackQueryId: string, text?: string) {
+  if (!token || !callbackQueryId) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callback_query_id: callbackQueryId, text: text || '' }),
+      signal: AbortSignal.timeout(5000)
+    });
+  } catch (e) {}
+}
+
+async function generateAndSendTelegramLicense(
+  cfg: any,
+  chatId: string,
+  fromLabel: string,
+  customerName: string,
+  duration: '1_week' | '1_month' | '3_months' | '6_months' | '1_year' | 'lifetime',
+  deviceLimit: 1 | 2
+) {
+  const appUrl = getPublicAppUrl();
+  const safeName = (customerName || '').trim() || 'Engineer Customer';
+
+  // DEDUPLICATION: Prevent accidental double-tap duplicates within 15s (distinct by duration + deviceLimit)
+  const dedupKey = `${chatId}_${safeName.toLowerCase()}_${duration}_${deviceLimit}`;
+  const recent = recentCommandCache.get(dedupKey);
+  let newLic: any;
+  let isDuplicate = false;
+
+  if (recent && (Date.now() - recent.time < 15000)) {
+    newLic = recent.license;
+    isDuplicate = true;
+  } else {
+    await pullAndMergeLicensesFromSupabase();
+    newLic = generateLicenseRecord(safeName, duration, deviceLimit, `Generated via Telegram Bot (${fromLabel})`);
+    recentCommandCache.set(dedupKey, { time: Date.now(), license: newLic });
+    if (recentCommandCache.size > 200) {
+      const oldest = recentCommandCache.keys().next().value;
+      if (oldest) recentCommandCache.delete(oldest);
+    }
+  }
+
+  const activationLink = `${appUrl}/?license=${newLic.token}`;
+  const durLabel =
+    duration === '1_week' ? '1 Week (7 Days)' :
+    duration === '1_month' ? '1 Month (30 Days)' :
+    duration === '3_months' ? '3 Months (90 Days)' :
+    duration === '6_months' ? '6 Months (180 Days)' :
+    duration === '1_year' ? '1 Year (365 Days)' :
+    'Lifetime (10 Years)';
+
+  const expiresDateStr = new Date(newLic.expiresAt).toLocaleDateString('en-US', {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric'
+  });
+
+  const escapeTelegramHtml = (str: string) =>
+    String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  const dupNotice = isDuplicate
+    ? '⚠️ <i>(လွန်ခဲ့သော စက္ကန့်ပိုင်းက ထုတ်ထားပြီးဖြစ်သော လိုင်စင်အား ပြန်လည်ပြသပေးထားပါသည် - Duplicate Prevented)</i>\n\n'
+    : '';
+
+  const replyMsg = `${dupNotice}🎉 <b>PRO LICENSE ထုတ်လုပ်ပြီးပါပြီ!</b> ⚡️
+━━━━━━━━━━━━━━━━━
+👤 <b>ဝယ်ယူသူ:</b> ${escapeTelegramHtml(safeName)}
+⏳ <b>သက်တမ်း:</b> ${durLabel}
+📅 <b>ကုန်ဆုံးမည့်ရက်:</b> ${expiresDateStr}
+📱 <b>ခွင့်ပြုစက်:</b> ${newLic.deviceLimit} Device(s)
+
+🌐 <b>VPN မလိုဘဲ တိုက်ရိုက်ဖွင့်ရန် (One-Click Link):</b>
+${activationLink}
+
+🔑 <b>License Key:</b>
+<code>${newLic.token}</code>
+<i>👉 အကယ်၍ Link မဖွင့်ချင်ပါက App ၏ "Enter License Key" တွင် ဤ Key ကို ကူးထည့်ရုံဖြင့်လည်း VPN မလိုဘဲ Activate ဖြစ်ပါသည်!</i>
+━━━━━━━━━━━━━━━━━
+<i>(ဝယ်ယူသူထံ ဤစာတိုကို တိုက်ရိုက် Forward ပို့ပေးလိုက်ရုံဖြင့် အလွယ်တကူ Activate ပြုလုပ်နိုင်ပါသည်)</i>`;
+
+  await sendTelegramMessage(cfg.botToken, chatId, replyMsg, 'HTML', {
+    inline_keyboard: [
+      [
+        { text: '⚡️ 1-Click Activate PRO', url: activationLink },
+        { text: '☀️ Open App', url: appUrl }
+      ]
+    ]
+  });
+}
+
+async function handleTelegramCallbackQuery(cfg: any, cbq: any) {
+  if (!cbq || !cbq.data) return;
+  const chatId = String(cbq.message?.chat?.id || cbq.from?.id || '');
+  const isAdmin = !cfg.adminChatId || chatId === String(cfg.adminChatId);
+  if (!isAdmin) {
+    await answerTelegramCallbackQuery(cfg.botToken, cbq.id, '⛔️ Admin only');
+    return;
+  }
+
+  const dataStr = String(cbq.data);
+  if (dataStr.startsWith('qgen:')) {
+    const [, promptId, durRaw, devRaw] = dataStr.split(':');
+    const duration = parseDurationToken(durRaw);
+    if (!duration) {
+      await answerTelegramCallbackQuery(cfg.botToken, cbq.id, 'Invalid duration');
+      return;
+    }
+    const pending = pendingGenPrompts.get(promptId);
+    const customerName = pending?.customerName || 'Engineer Customer';
+    const deviceLimit: 1 | 2 = devRaw === '2' ? 2 : (pending?.deviceLimit || 1);
+    const fromLabel = cbq.from?.username ? `@${cbq.from.username}` : (cbq.from?.first_name || 'Admin');
+
+    await answerTelegramCallbackQuery(cfg.botToken, cbq.id, `Generating ${duration.replace('_', ' ')} key...`);
+    await generateAndSendTelegramLicense(cfg, chatId, fromLabel, customerName, duration, deviceLimit);
+  }
+}
 
 function stopTelegramPolling() {
   if (telegramPollingTimeout) {
@@ -1692,7 +1977,8 @@ async function pollTelegramUpdates() {
     let lastTelegramUpdateId = Number(cfg.lastUpdateId || 0);
     pollingAbortController = new AbortController();
 
-    const url = `https://api.telegram.org/bot${cfg.botToken}/getUpdates?offset=${lastTelegramUpdateId + 1}&timeout=8`;
+    const allowedUpdates = encodeURIComponent(JSON.stringify(["message", "callback_query"]));
+    const url = `https://api.telegram.org/bot${cfg.botToken}/getUpdates?offset=${lastTelegramUpdateId + 1}&timeout=8&allowed_updates=${allowedUpdates}`;
     const res = await fetch(url, { 
       signal: AbortSignal.timeout(12000) 
     });
@@ -1724,6 +2010,8 @@ async function pollTelegramUpdates() {
           // Immediately send typing status to Telegram so user gets instant feedback
           sendTelegramChatAction(cfg.botToken, String(update.message.chat.id), 'typing').catch(() => {});
           await handleTelegramIncomingMessage(cfg, update.message);
+        } else if (update.callback_query) {
+          await handleTelegramCallbackQuery(cfg, update.callback_query);
         }
       }
 
@@ -1903,21 +2191,22 @@ Bot ချိတ်ဆက်ထားသော GitHub Pages Link:
 🌐 <code>${appUrl}</code>
 
 📌 <b>အသုံးပြုနိုင်သော Admin Commands များ:</b>
-1️⃣ <b>လိုင်စင်ထုတ်ရန်:</b>
+1️⃣ <b>လိုင်စင်ထုတ်ရန် (နာမည် Space ပါလည်း ရပါသည်):</b>
 <code>/gen &lt;နာမည်&gt; &lt;သက်တမ်း&gt; [စက်အရေအတွက်]</code>
 ဥပမာများ:
-• <code>/gen KoAung 1m 1</code>
-• <code>/gen DawHla 3m 2</code>
-• <code>/gen 09798111222 1y 1</code>
-• <code>/gen Engineer_U_Kyaw life 2</code>
+• <code>/gen Ko Aung 1w 1</code> (၁ ပတ် - ၇ ရက်)
+• <code>/gen Ko Aung 1m 1</code> (၁ လ - ၃၀ ရက်)
+• <code>/gen Daw Hla 3m 2</code> (၃ လ - ၉၀ ရက်)
+• <code>/gen 09798111222 1y 1</code> (၁ နှစ် - ၃၆၅ ရက်)
+• <code>/gen Engineer U Kyaw life 2</code> (တစ်သက်တာ)
 
-⏳ <b>သက်တမ်း အတိုကောက်များ:</b>
-• <code>1w</code> = 1 Week (၇ ရက်)
-• <code>1m</code> = 1 Month (ရက် ၃၀)
-• <code>3m</code> = 3 Months (ရက် ၉၀)
-• <code>6m</code> = 6 Months (၁၈၀ ရက်)
-• <code>1y</code> = 1 Year (၃၆၅ ရက်)
-• <code>life</code> = Lifetime (၁၀ နှစ်)
+⚡️ <b>အမြန်ထုတ်နည်း (Quick Commands):</b>
+• <code>/1w Ko Aung 1</code> — 1 Week (၇ ရက်)
+• <code>/1m Ko Aung 1</code> — 1 Month (ရက် ၃၀)
+• <code>/3m Ko Aung 2</code> — 3 Months (ရက် ၉၀)
+• <code>/6m Ko Aung 2</code> — 6 Months (၁၈၀ ရက်)
+• <code>/1y Ko Aung 1</code> — 1 Year (၃၆၅ ရက်)
+• <code>/life Ko Aung 2</code> — Lifetime (၁၀ နှစ်)
 
 2️⃣ <b>လိုင်စင်များ ကြည့်ရန် & ဒေါင်းလုဒ် ရယူရန်:</b>
 • <code>/licenses</code> - နောက်ဆုံး ထုတ်ထားသော စာရင်းများ
@@ -1970,75 +2259,85 @@ Bot ချိတ်ဆက်ထားသော GitHub Pages Link:
     return;
   }
 
-  if (cmd === '/gen' || cmd === '/generate') {
-    if (parts.length < 3) {
-      await sendTelegramMessage(cfg.botToken, chatId, `⚠️ <b>အသုံးပြုပုံ မှားယွင်းနေပါသည်!</b>
-အောက်ပါ ပုံစံအတိုင်း ရိုက်ထည့်ပေးပါ:
-<code>/gen &lt;နာမည်&gt; &lt;သက်တမ်း&gt; [စက်အရေအတွက်]</code>
-ဥပမာ: <code>/gen KoAung 1m 1</code> သို့မဟုတ် <code>/gen DawMya 3m 2</code>`, 'HTML');
+  // Shorthand quick duration commands: /1w, /1m, /3m, /6m, /1y, /life (and /gen, /generate, /gen1w...)
+  const shorthandDurationMap: Record<string, '1_week' | '1_month' | '3_months' | '6_months' | '1_year' | 'lifetime'> = {
+    '/1w': '1_week',
+    '/1week': '1_week',
+    '/gen1w': '1_week',
+    '/gen_1w': '1_week',
+    '/1m': '1_month',
+    '/1month': '1_month',
+    '/gen1m': '1_month',
+    '/gen_1m': '1_month',
+    '/3m': '3_months',
+    '/3months': '3_months',
+    '/gen3m': '3_months',
+    '/gen_3m': '3_months',
+    '/6m': '6_months',
+    '/6months': '6_months',
+    '/gen6m': '6_months',
+    '/gen_6m': '6_months',
+    '/1y': '1_year',
+    '/1year': '1_year',
+    '/gen1y': '1_year',
+    '/gen_1y': '1_year',
+    '/life': 'lifetime',
+    '/lifetime': 'lifetime',
+    '/genlife': 'lifetime',
+    '/gen_life': 'lifetime'
+  };
+  const fixedDuration = shorthandDurationMap[cmd];
+
+  if (cmd === '/gen' || cmd === '/generate' || fixedDuration) {
+    const parsed = parseTelegramGenArgs(parts.slice(1), fixedDuration);
+
+    // NEVER silently default to 1_month if duration was missing or invalid — show quick inline duration picker buttons!
+    if (!parsed.duration) {
+      const pendingId = Math.random().toString(36).substring(2, 8);
+      const pendingName = parsed.customerName || 'Engineer Customer';
+      const escapedPendingName = pendingName.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      pendingGenPrompts.set(pendingId, {
+        customerName: pendingName,
+        deviceLimit: parsed.deviceLimit,
+        createdAt: Date.now()
+      });
+      if (pendingGenPrompts.size > 200) {
+        const oldest = pendingGenPrompts.keys().next().value;
+        if (oldest) pendingGenPrompts.delete(oldest);
+      }
+
+      const warnMsg = parsed.customerName
+        ? `⏳ <b>${escapedPendingName}</b> အတွက် သက်တမ်း (Duration) ကို အောက်ပါခလုတ်များမှ တိုက်ရိုက်ရွေးချယ်နိုင်ပါသည် (သို့မဟုတ် <code>/gen ${escapedPendingName} 1w 1</code> ပုံစံဖြင့် ရိုက်ပို့ပါ):`
+        : `⚠️ <b>သက်တမ်း (1w / 1m / 3m / 6m / 1y / life) ကို ထည့်သွင်းပေးပါ!</b>\n\n📌 <b>ဥပမာများ:</b>\n• <code>/gen Ko Aung 1w 1</code> (၁ ပတ်)\n• <code>/gen Ko Aung 1m 1</code> (၁ လ)\n• <code>/gen Ko Aung 3m 2</code> (၃ လ - ၂ လုံး)\n• <code>/gen Ko Aung 1y 1</code> (၁ နှစ်)\n• <code>/1w Ko Aung</code> (အမြန်ထုတ်နည်း)\n\n👇 သို့မဟုတ် အောက်ပါခလုတ်ဖြင့် တိုက်ရိုက်ထုတ်နိုင်ပါသည်:`;
+
+      await sendTelegramMessage(cfg.botToken, chatId, warnMsg, 'HTML', {
+        inline_keyboard: [
+          [
+            { text: '🗓 1 Week (7d)', callback_data: `qgen:${pendingId}:1_week:${parsed.deviceLimit}` },
+            { text: '🗓 1 Month (30d)', callback_data: `qgen:${pendingId}:1_month:${parsed.deviceLimit}` }
+          ],
+          [
+            { text: '🗓 3 Months (90d)', callback_data: `qgen:${pendingId}:3_months:${parsed.deviceLimit}` },
+            { text: '🗓 6 Months (180d)', callback_data: `qgen:${pendingId}:6_months:${parsed.deviceLimit}` }
+          ],
+          [
+            { text: '🗓 1 Year (365d)', callback_data: `qgen:${pendingId}:1_year:${parsed.deviceLimit}` },
+            { text: '♾ Lifetime (10y)', callback_data: `qgen:${pendingId}:lifetime:${parsed.deviceLimit}` }
+          ]
+        ]
+      });
       return;
     }
 
-    const customerName = parts[1];
-    const durRaw = parts[2].toLowerCase();
-    const devLimitRaw = parts[3] ? parseInt(parts[3], 10) : 1;
-    const deviceLimit = devLimitRaw === 2 ? 2 : 1;
-
-    let duration = '1_month';
-    if (durRaw === '1w' || durRaw === '1week') duration = '1_week';
-    else if (durRaw === '1m' || durRaw === '1month') duration = '1_month';
-    else if (durRaw === '3m' || durRaw === '3months') duration = '3_months';
-    else if (durRaw === '6m' || durRaw === '6months') duration = '6_months';
-    else if (durRaw === '1y' || durRaw === '1year') duration = '1_year';
-    else if (durRaw === 'life' || durRaw === 'lifetime') duration = 'lifetime';
-
-    // DEDUPLICATION: Prevent duplicate keys if user sent multiple times within 20s
-    const dedupKey = `${chatId}_${customerName.toLowerCase()}_${duration}_${deviceLimit}`;
-    const recent = recentCommandCache.get(dedupKey);
-    let newLic: any;
-    let isDuplicate = false;
-
-    if (recent && (Date.now() - recent.time < 20000)) {
-      newLic = recent.license;
-      isDuplicate = true;
-    } else {
-      await pullAndMergeLicensesFromSupabase();
-      newLic = generateLicenseRecord(customerName, duration, deviceLimit, `Generated via Telegram Bot (@${msg.from?.username || fromName})`);
-      recentCommandCache.set(dedupKey, { time: Date.now(), license: newLic });
-      if (recentCommandCache.size > 200) {
-        const oldest = recentCommandCache.keys().next().value;
-        if (oldest) recentCommandCache.delete(oldest);
-      }
-    }
-
-    const activationLink = `${appUrl}/?license=${newLic.token}`;
-    const durLabel = duration === '1_week' ? '1 Week (7 Days)' : duration === '1_month' ? '1 Month (30 Days)' : duration === '3_months' ? '3 Months (90 Days)' : duration === '6_months' ? '6 Months (180 Days)' : duration === '1_year' ? '1 Year (365 Days)' : 'Lifetime (10 Years)';
-
-    const dupNotice = isDuplicate ? '⚠️ <i>(လွန်ခဲ့သော စက္ကန့်ပိုင်းက ထုတ်ထားပြီးဖြစ်သော လိုင်စင်အား ပြန်လည်ပြသပေးထားပါသည် - Duplicate Prevented)</i>\n\n' : '';
-
-    const replyMsg = `${dupNotice}🎉 <b>PRO LICENSE ထုတ်လုပ်ပြီးပါပြီ!</b> ⚡️
-━━━━━━━━━━━━━━━━━
-👤 <b>ဝယ်ယူသူ:</b> ${customerName}
-⏳ <b>သက်တမ်း:</b> ${durLabel}
-📱 <b>ခွင့်ပြုစက်:</b> ${newLic.deviceLimit} Device(s)
-
-🌐 <b>VPN မလိုဘဲ တိုက်ရိုက်ဖွင့်ရန် (One-Click Link):</b>
-${activationLink}
-
-🔑 <b>License Key:</b>
-<code>${newLic.token}</code>
-<i>👉 အကယ်၍ Link မဖွင့်ချင်ပါက App ၏ "Enter License Key" တွင် ဤ Key ကို ကူးထည့်ရုံဖြင့်လည်း VPN မလိုဘဲ Activate ဖြစ်ပါသည်!</i>
-━━━━━━━━━━━━━━━━━
-<i>(ဝယ်ယူသူထံ ဤစာတိုကို တိုက်ရိုက် Forward ပို့ပေးလိုက်ရုံဖြင့် အလွယ်တကူ Activate ပြုလုပ်နိုင်ပါသည်)</i>`;
-
-    await sendTelegramMessage(cfg.botToken, chatId, replyMsg, 'HTML', {
-      inline_keyboard: [
-        [
-          { text: '⚡️ 1-Click Activate PRO', url: activationLink },
-          { text: '☀️ Open App', url: appUrl }
-        ]
-      ]
-    });
+    const fromLabel = msg.from?.username ? `@${msg.from.username}` : fromName;
+    await generateAndSendTelegramLicense(
+      cfg,
+      chatId,
+      fromLabel,
+      parsed.customerName || 'Engineer Customer',
+      parsed.duration,
+      parsed.deviceLimit
+    );
     return;
   }
 
@@ -2095,7 +2394,7 @@ ${activationLink}
   await sendTelegramMessage(
     cfg.botToken, 
     chatId, 
-    `💡 လိုင်စင်ထုတ်ယူရန် <code>/gen &lt;နာမည်&gt; &lt;သက်တမ်း&gt; [စက်အရေအတွက်]</code> ဟု ရိုက်ပို့ပါခင်ဗျာ။\nဥပမာ: <code>/gen KoAung 1m 1</code>\n🌐 App Link ရယူရန် <code>/app</code> ဟု ပို့ပေးပါ။`,
+    `💡 လိုင်စင်ထုတ်ယူရန် <code>/gen &lt;နာမည်&gt; &lt;1w|1m|3m|6m|1y|life&gt; [1|2]</code> ဟု ရိုက်ပို့ပါခင်ဗျာ။\nဥပမာ: <code>/gen Ko Aung 1w 1</code> သို့မဟုတ် <code>/1w Ko Aung 1</code>\n🌐 App Link ရယူရန် <code>/app</code> ဟု ပို့ပေးပါ။`,
     'HTML',
     {
       inline_keyboard: [
@@ -2228,8 +2527,12 @@ app.post("/api/telegram/sync-menu", async (req, res) => {
 app.post("/api/telegram/webhook", async (req, res) => {
   try {
     const cfg = memoryStorage["telegram_bot"];
-    if (cfg && cfg.enabled && req.body && req.body.message) {
-      await handleTelegramIncomingMessage(cfg, req.body.message);
+    if (cfg && cfg.enabled && req.body) {
+      if (req.body.message) {
+        await handleTelegramIncomingMessage(cfg, req.body.message);
+      } else if (req.body.callback_query) {
+        await handleTelegramCallbackQuery(cfg, req.body.callback_query);
+      }
     }
     res.json({ ok: true });
   } catch (err) {

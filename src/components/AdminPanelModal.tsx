@@ -1896,9 +1896,15 @@ ${lic.token}
                   </span>
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 font-mono text-[11px]">
                     <div className="p-2.5 rounded-xl bg-slate-900 border border-slate-800 space-y-1">
-                      <span className="text-sky-300 font-bold block">/gen &lt;name&gt; &lt;duration&gt; [devices]</span>
+                      <span className="text-sky-300 font-bold block">/gen &lt;name&gt; &lt;1w|1m|3m|6m|1y|life&gt; [1|2]</span>
                       <p className="text-[10px] text-slate-400 font-sans">
-                        လိုင်စင်ထုတ်ရန် (ဥပမာ: <span className="text-white font-mono">/gen KoAung 1m 1</span> သို့မဟုတ် <span className="text-white font-mono">/gen DawMya 3m 2</span>)
+                        လိုင်စင်ထုတ်ရန် (ဥပမာ: <span className="text-white font-mono">/gen Ko Aung 1w 1</span>, <span className="text-white font-mono">/gen Daw Mya 1m 2</span>, <span className="text-white font-mono">/gen U Ba 1y 1</span>)
+                      </p>
+                    </div>
+                    <div className="p-2.5 rounded-xl bg-slate-900 border border-slate-800 space-y-1">
+                      <span className="text-emerald-300 font-bold block">/1w  /1m  /3m  /6m  /1y  /life &lt;name&gt; [1|2]</span>
+                      <p className="text-[10px] text-slate-400 font-sans">
+                        အမြန်လိုင်စင်ထုတ်ရန် (ဥပမာ: <span className="text-white font-mono">/1w Ko Aung 1</span>, <span className="text-white font-mono">/1y Ko Mg 2</span> — သက်တမ်းမထည့်မိပါက ခလုတ်ဖြင့် ရွေးနိုင်သည်)
                       </p>
                     </div>
                     <div className="p-2.5 rounded-xl bg-slate-900 border border-slate-800 space-y-1">
@@ -1908,15 +1914,9 @@ ${lic.token}
                       </p>
                     </div>
                     <div className="p-2.5 rounded-xl bg-slate-900 border border-slate-800 space-y-1">
-                      <span className="text-sky-300 font-bold block">/stats</span>
+                      <span className="text-sky-300 font-bold block">/stats  •  /help</span>
                       <p className="text-[10px] text-slate-400 font-sans">
-                        စုစုပေါင်း လိုင်စင်နှင့် စက်အရေအတွက် စာရင်းချုပ် ကြည့်ရန်
-                      </p>
-                    </div>
-                    <div className="p-2.5 rounded-xl bg-slate-900 border border-slate-800 space-y-1">
-                      <span className="text-sky-300 font-bold block">/help</span>
-                      <p className="text-[10px] text-slate-400 font-sans">
-                        အသုံးပြုပုံ လမ်းညွှန်နှင့် သက်တမ်း အတိုကောက်များ ကြည့်ရန်
+                        စုစုပေါင်း လိုင်စင်စာရင်းချုပ်နှင့် အသုံးပြုပုံ လမ်းညွှန် ကြည့်ရန်
                       </p>
                     </div>
                   </div>

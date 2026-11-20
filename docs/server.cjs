@@ -1086,8 +1086,212 @@ async function autoSyncLicenseToGoogleSheet(lic) {
   } catch (err) {
   }
 }
+function normalizeMyanmarDigits(str) {
+  return String(str || "").replace(/[၀-၉]/g, (ch) => String(ch.charCodeAt(0) - 4160));
+}
+function parseDurationToken(raw) {
+  const cleaned = normalizeMyanmarDigits(raw || "").trim().replace(/^[,.:;]+|[,.:;]+$/g, "").toLowerCase().replace(/[\s_\-]+/g, "");
+  if (!cleaned) return null;
+  if ([
+    "1w",
+    "1wk",
+    "1wks",
+    "week",
+    "1week",
+    "1weeks",
+    "7d",
+    "7day",
+    "7days",
+    "1\u1015\u1010\u103A",
+    "\u1015\u1010\u103A",
+    "7\u101B\u1000\u103A"
+  ].includes(cleaned)) {
+    return "1_week";
+  }
+  if ([
+    "1m",
+    "1mo",
+    "1mon",
+    "1mons",
+    "month",
+    "1month",
+    "1months",
+    "30d",
+    "30day",
+    "30days",
+    "1\u101C",
+    "30\u101B\u1000\u103A"
+  ].includes(cleaned)) {
+    return "1_month";
+  }
+  if ([
+    "3m",
+    "3mo",
+    "3mon",
+    "3mons",
+    "3month",
+    "3months",
+    "90d",
+    "90day",
+    "90days",
+    "3\u101C",
+    "90\u101B\u1000\u103A"
+  ].includes(cleaned)) {
+    return "3_months";
+  }
+  if ([
+    "6m",
+    "6mo",
+    "6mon",
+    "6mons",
+    "6month",
+    "6months",
+    "180d",
+    "180day",
+    "180days",
+    "6\u101C",
+    "180\u101B\u1000\u103A"
+  ].includes(cleaned)) {
+    return "6_months";
+  }
+  if ([
+    "1y",
+    "1yr",
+    "1yrs",
+    "year",
+    "1year",
+    "1years",
+    "12m",
+    "12mo",
+    "12mon",
+    "12month",
+    "12months",
+    "365d",
+    "365day",
+    "365days",
+    "1\u1014\u103E\u1005\u103A",
+    "\u1014\u103E\u1005\u103A",
+    "12\u101C",
+    "365\u101B\u1000\u103A"
+  ].includes(cleaned)) {
+    return "1_year";
+  }
+  if ([
+    "life",
+    "lifetime",
+    "forever",
+    "unlimited",
+    "perm",
+    "permanent",
+    "10y",
+    "10yr",
+    "10year",
+    "10years",
+    "\u1010\u1005\u103A\u101E\u1000\u103A\u1010\u102C"
+  ].includes(cleaned)) {
+    return "lifetime";
+  }
+  return null;
+}
+function parseDeviceLimitToken(raw, allowBareNumber = true) {
+  const cleaned = normalizeMyanmarDigits(raw || "").trim().replace(/^[,.:;]+|[,.:;]+$/g, "").toLowerCase().replace(/[\s_\-]+/g, "");
+  if (!cleaned) return null;
+  if (["1d", "1dev", "1device", "1devices", "1\u101C\u102F\u1036\u1038"].includes(cleaned)) return 1;
+  if (["2d", "2dev", "2device", "2devices", "2\u101C\u102F\u1036\u1038"].includes(cleaned)) return 2;
+  if (allowBareNumber && cleaned === "1") return 1;
+  if (allowBareNumber && cleaned === "2") return 2;
+  return null;
+}
+function parseTelegramGenArgs(rawArgs, fixedDuration) {
+  const tokens = [];
+  for (let i = 0; i < rawArgs.length; i++) {
+    const cur = rawArgs[i];
+    const next = rawArgs[i + 1];
+    if (cur && next) {
+      const curNorm = normalizeMyanmarDigits(cur).trim().replace(/^[,.:;]+|[,.:;]+$/g, "").toLowerCase();
+      const nextNorm = normalizeMyanmarDigits(next).trim().replace(/^[,.:;]+|[,.:;]+$/g, "").toLowerCase();
+      const isNum = /^\d+$/.test(curNorm);
+      const isDurUnit = [
+        "w",
+        "wk",
+        "wks",
+        "week",
+        "weeks",
+        "m",
+        "mo",
+        "mon",
+        "mons",
+        "month",
+        "months",
+        "y",
+        "yr",
+        "yrs",
+        "year",
+        "years",
+        "day",
+        "days",
+        "\u1015\u1010\u103A",
+        "\u101C",
+        "\u1014\u103E\u1005\u103A",
+        "\u101B\u1000\u103A"
+      ].includes(nextNorm) || nextNorm === "d" && ["7", "30", "90", "180", "365"].includes(curNorm);
+      const isDevUnit = ["dev", "device", "devices", "\u101C\u102F\u1036\u1038"].includes(nextNorm) || nextNorm === "d" && ["1", "2"].includes(curNorm);
+      if (isNum && (isDurUnit || isDevUnit)) {
+        tokens.push(`${curNorm}${nextNorm}`);
+        i++;
+        continue;
+      }
+    }
+    tokens.push(cur);
+  }
+  let duration = fixedDuration || null;
+  let durIdx = -1;
+  if (!duration) {
+    for (let i = tokens.length - 1; i >= 0; i--) {
+      const parsed = parseDurationToken(tokens[i]);
+      if (parsed) {
+        duration = parsed;
+        durIdx = i;
+        break;
+      }
+    }
+  }
+  let deviceLimit = 1;
+  let devIdx = -1;
+  if (durIdx !== -1 && durIdx + 1 < tokens.length) {
+    const afterDur = parseDeviceLimitToken(tokens[durIdx + 1], true);
+    if (afterDur !== null) {
+      deviceLimit = afterDur;
+      devIdx = durIdx + 1;
+    }
+  }
+  if (devIdx === -1 && tokens.length > 0) {
+    const lastIdx = tokens.length - 1;
+    if (lastIdx !== durIdx) {
+      const lastDev = parseDeviceLimitToken(tokens[lastIdx], true);
+      if (lastDev !== null) {
+        deviceLimit = lastDev;
+        devIdx = lastIdx;
+      }
+    }
+  }
+  if (devIdx === -1) {
+    for (let i = tokens.length - 1; i >= 0; i--) {
+      if (i === durIdx) continue;
+      const explicitDev = parseDeviceLimitToken(tokens[i], false);
+      if (explicitDev !== null) {
+        deviceLimit = explicitDev;
+        devIdx = i;
+        break;
+      }
+    }
+  }
+  const nameTokens = tokens.filter((_, idx) => idx !== durIdx && idx !== devIdx).map((t) => t.replace(/^,+|,+$/g, "")).filter(Boolean);
+  const customerName = nameTokens.join(" ").trim();
+  return { customerName, duration, deviceLimit };
+}
 function generateLicenseRecord(customerName, duration, deviceLimit = 1, note) {
-  const d = duration || "1_month";
+  const d = parseDurationToken(duration) || "1_month";
   let days = 30;
   if (d === "1_week") days = 7;
   else if (d === "1_month") days = 30;
@@ -1095,8 +1299,8 @@ function generateLicenseRecord(customerName, duration, deviceLimit = 1, note) {
   else if (d === "6_months") days = 180;
   else if (d === "1_year") days = 365;
   else if (d === "lifetime") days = 3650;
-  const rand1 = Math.random().toString(36).substring(2, 6).toUpperCase();
-  const rand2 = Math.random().toString(36).substring(2, 6).toUpperCase();
+  const rand1 = (Math.random().toString(36).substring(2, 6) + "ABCD").substring(0, 4).toUpperCase();
+  const rand2 = (Math.random().toString(36).substring(2, 6) + "WXYZ").substring(0, 4).toUpperCase();
   const durCode = d === "1_week" ? "1W" : d === "1_month" ? "1M" : d === "3_months" ? "3M" : d === "6_months" ? "6M" : d === "1_year" ? "1Y" : "LIFE";
   const devCode = deviceLimit === 2 ? "2D" : "1D";
   const token = `SOLAR-PRO-${durCode}-${devCode}-${rand1}-${rand2}`;
@@ -1394,12 +1598,16 @@ async function syncTelegramBotProfileAndMenu(token, appUrl) {
       body: JSON.stringify({
         commands: [
           { command: "start", description: "Open App & Usage Guide" },
-          { command: "app", description: "Open Unique Solar Pro on GitHub Pages" },
-          { command: "gen", description: "[Admin] /gen <name> <duration> [devices]" },
+          { command: "gen", description: "[Admin] /gen <name> <1w|1m|3m|6m|1y|life> [1|2]" },
+          { command: "1w", description: "[Admin] Quick 1 Week key (/1w <name> [1|2])" },
+          { command: "1m", description: "[Admin] Quick 1 Month key (/1m <name> [1|2])" },
+          { command: "3m", description: "[Admin] Quick 3 Months key (/3m <name> [1|2])" },
+          { command: "6m", description: "[Admin] Quick 6 Months key (/6m <name> [1|2])" },
+          { command: "1y", description: "[Admin] Quick 1 Year key (/1y <name> [1|2])" },
           { command: "licenses", description: "[Admin] View recent licenses" },
           { command: "csv", description: "[Admin] Download license Excel / CSV" },
           { command: "stats", description: "[Admin] Total licenses & bound devices" },
-          { command: "id", description: "View Telegram Chat ID" },
+          { command: "app", description: "Open Unique Solar Pro on GitHub Pages" },
           { command: "help", description: "Commands cheat sheet" }
         ]
       }),
@@ -1501,6 +1709,95 @@ var isPollingFetchInProgress = false;
 var pollingAbortController = null;
 var processedUpdateIds = /* @__PURE__ */ new Set();
 var recentCommandCache = /* @__PURE__ */ new Map();
+var pendingGenPrompts = /* @__PURE__ */ new Map();
+async function answerTelegramCallbackQuery(token, callbackQueryId, text) {
+  if (!token || !callbackQueryId) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ callback_query_id: callbackQueryId, text: text || "" }),
+      signal: AbortSignal.timeout(5e3)
+    });
+  } catch (e) {
+  }
+}
+async function generateAndSendTelegramLicense(cfg, chatId, fromLabel, customerName, duration, deviceLimit) {
+  const appUrl = getPublicAppUrl();
+  const safeName = (customerName || "").trim() || "Engineer Customer";
+  const dedupKey = `${chatId}_${safeName.toLowerCase()}_${duration}_${deviceLimit}`;
+  const recent = recentCommandCache.get(dedupKey);
+  let newLic;
+  let isDuplicate = false;
+  if (recent && Date.now() - recent.time < 15e3) {
+    newLic = recent.license;
+    isDuplicate = true;
+  } else {
+    await pullAndMergeLicensesFromSupabase();
+    newLic = generateLicenseRecord(safeName, duration, deviceLimit, `Generated via Telegram Bot (${fromLabel})`);
+    recentCommandCache.set(dedupKey, { time: Date.now(), license: newLic });
+    if (recentCommandCache.size > 200) {
+      const oldest = recentCommandCache.keys().next().value;
+      if (oldest) recentCommandCache.delete(oldest);
+    }
+  }
+  const activationLink = `${appUrl}/?license=${newLic.token}`;
+  const durLabel = duration === "1_week" ? "1 Week (7 Days)" : duration === "1_month" ? "1 Month (30 Days)" : duration === "3_months" ? "3 Months (90 Days)" : duration === "6_months" ? "6 Months (180 Days)" : duration === "1_year" ? "1 Year (365 Days)" : "Lifetime (10 Years)";
+  const expiresDateStr = new Date(newLic.expiresAt).toLocaleDateString("en-US", {
+    year: "numeric",
+    month: "short",
+    day: "numeric"
+  });
+  const escapeTelegramHtml = (str) => String(str || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const dupNotice = isDuplicate ? "\u26A0\uFE0F <i>(\u101C\u103D\u1014\u103A\u1001\u1032\u1037\u101E\u1031\u102C \u1005\u1000\u1039\u1000\u1014\u1037\u103A\u1015\u102D\u102F\u1004\u103A\u1038\u1000 \u1011\u102F\u1010\u103A\u1011\u102C\u1038\u1015\u103C\u102E\u1038\u1016\u103C\u1005\u103A\u101E\u1031\u102C \u101C\u102D\u102F\u1004\u103A\u1005\u1004\u103A\u1021\u102C\u1038 \u1015\u103C\u1014\u103A\u101C\u100A\u103A\u1015\u103C\u101E\u1015\u1031\u1038\u1011\u102C\u1038\u1015\u102B\u101E\u100A\u103A - Duplicate Prevented)</i>\n\n" : "";
+  const replyMsg = `${dupNotice}\u{1F389} <b>PRO LICENSE \u1011\u102F\u1010\u103A\u101C\u102F\u1015\u103A\u1015\u103C\u102E\u1038\u1015\u102B\u1015\u103C\u102E!</b> \u26A1\uFE0F
+\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
+\u{1F464} <b>\u101D\u101A\u103A\u101A\u1030\u101E\u1030:</b> ${escapeTelegramHtml(safeName)}
+\u23F3 <b>\u101E\u1000\u103A\u1010\u1019\u103A\u1038:</b> ${durLabel}
+\u{1F4C5} <b>\u1000\u102F\u1014\u103A\u1006\u102F\u1036\u1038\u1019\u100A\u1037\u103A\u101B\u1000\u103A:</b> ${expiresDateStr}
+\u{1F4F1} <b>\u1001\u103D\u1004\u1037\u103A\u1015\u103C\u102F\u1005\u1000\u103A:</b> ${newLic.deviceLimit} Device(s)
+
+\u{1F310} <b>VPN \u1019\u101C\u102D\u102F\u1018\u1032 \u1010\u102D\u102F\u1000\u103A\u101B\u102D\u102F\u1000\u103A\u1016\u103D\u1004\u1037\u103A\u101B\u1014\u103A (One-Click Link):</b>
+${activationLink}
+
+\u{1F511} <b>License Key:</b>
+<code>${newLic.token}</code>
+<i>\u{1F449} \u1021\u1000\u101A\u103A\u104D Link \u1019\u1016\u103D\u1004\u1037\u103A\u1001\u103B\u1004\u103A\u1015\u102B\u1000 App \u104F "Enter License Key" \u1010\u103D\u1004\u103A \u1024 Key \u1000\u102D\u102F \u1000\u1030\u1038\u1011\u100A\u1037\u103A\u101B\u102F\u1036\u1016\u103C\u1004\u1037\u103A\u101C\u100A\u103A\u1038 VPN \u1019\u101C\u102D\u102F\u1018\u1032 Activate \u1016\u103C\u1005\u103A\u1015\u102B\u101E\u100A\u103A!</i>
+\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
+<i>(\u101D\u101A\u103A\u101A\u1030\u101E\u1030\u1011\u1036 \u1024\u1005\u102C\u1010\u102D\u102F\u1000\u102D\u102F \u1010\u102D\u102F\u1000\u103A\u101B\u102D\u102F\u1000\u103A Forward \u1015\u102D\u102F\u1037\u1015\u1031\u1038\u101C\u102D\u102F\u1000\u103A\u101B\u102F\u1036\u1016\u103C\u1004\u1037\u103A \u1021\u101C\u103D\u101A\u103A\u1010\u1000\u1030 Activate \u1015\u103C\u102F\u101C\u102F\u1015\u103A\u1014\u102D\u102F\u1004\u103A\u1015\u102B\u101E\u100A\u103A)</i>`;
+  await sendTelegramMessage(cfg.botToken, chatId, replyMsg, "HTML", {
+    inline_keyboard: [
+      [
+        { text: "\u26A1\uFE0F 1-Click Activate PRO", url: activationLink },
+        { text: "\u2600\uFE0F Open App", url: appUrl }
+      ]
+    ]
+  });
+}
+async function handleTelegramCallbackQuery(cfg, cbq) {
+  if (!cbq || !cbq.data) return;
+  const chatId = String(cbq.message?.chat?.id || cbq.from?.id || "");
+  const isAdmin = !cfg.adminChatId || chatId === String(cfg.adminChatId);
+  if (!isAdmin) {
+    await answerTelegramCallbackQuery(cfg.botToken, cbq.id, "\u26D4\uFE0F Admin only");
+    return;
+  }
+  const dataStr = String(cbq.data);
+  if (dataStr.startsWith("qgen:")) {
+    const [, promptId, durRaw, devRaw] = dataStr.split(":");
+    const duration = parseDurationToken(durRaw);
+    if (!duration) {
+      await answerTelegramCallbackQuery(cfg.botToken, cbq.id, "Invalid duration");
+      return;
+    }
+    const pending = pendingGenPrompts.get(promptId);
+    const customerName = pending?.customerName || "Engineer Customer";
+    const deviceLimit = devRaw === "2" ? 2 : pending?.deviceLimit || 1;
+    const fromLabel = cbq.from?.username ? `@${cbq.from.username}` : cbq.from?.first_name || "Admin";
+    await answerTelegramCallbackQuery(cfg.botToken, cbq.id, `Generating ${duration.replace("_", " ")} key...`);
+    await generateAndSendTelegramLicense(cfg, chatId, fromLabel, customerName, duration, deviceLimit);
+  }
+}
 function stopTelegramPolling() {
   if (telegramPollingTimeout) {
     clearTimeout(telegramPollingTimeout);
@@ -1539,7 +1836,8 @@ async function pollTelegramUpdates() {
   try {
     let lastTelegramUpdateId = Number(cfg.lastUpdateId || 0);
     pollingAbortController = new AbortController();
-    const url = `https://api.telegram.org/bot${cfg.botToken}/getUpdates?offset=${lastTelegramUpdateId + 1}&timeout=8`;
+    const allowedUpdates = encodeURIComponent(JSON.stringify(["message", "callback_query"]));
+    const url = `https://api.telegram.org/bot${cfg.botToken}/getUpdates?offset=${lastTelegramUpdateId + 1}&timeout=8&allowed_updates=${allowedUpdates}`;
     const res = await fetch(url, {
       signal: AbortSignal.timeout(12e3)
     });
@@ -1565,6 +1863,8 @@ async function pollTelegramUpdates() {
           sendTelegramChatAction(cfg.botToken, String(update.message.chat.id), "typing").catch(() => {
           });
           await handleTelegramIncomingMessage(cfg, update.message);
+        } else if (update.callback_query) {
+          await handleTelegramCallbackQuery(cfg, update.callback_query);
         }
       }
       if (receivedUpdatesCount > 0) {
@@ -1735,21 +2035,22 @@ Bot \u1001\u103B\u102D\u1010\u103A\u1006\u1000\u103A\u1011\u102C\u1038\u101E\u10
 \u{1F310} <code>${appUrl}</code>
 
 \u{1F4CC} <b>\u1021\u101E\u102F\u1036\u1038\u1015\u103C\u102F\u1014\u102D\u102F\u1004\u103A\u101E\u1031\u102C Admin Commands \u1019\u103B\u102C\u1038:</b>
-1\uFE0F\u20E3 <b>\u101C\u102D\u102F\u1004\u103A\u1005\u1004\u103A\u1011\u102F\u1010\u103A\u101B\u1014\u103A:</b>
+1\uFE0F\u20E3 <b>\u101C\u102D\u102F\u1004\u103A\u1005\u1004\u103A\u1011\u102F\u1010\u103A\u101B\u1014\u103A (\u1014\u102C\u1019\u100A\u103A Space \u1015\u102B\u101C\u100A\u103A\u1038 \u101B\u1015\u102B\u101E\u100A\u103A):</b>
 <code>/gen &lt;\u1014\u102C\u1019\u100A\u103A&gt; &lt;\u101E\u1000\u103A\u1010\u1019\u103A\u1038&gt; [\u1005\u1000\u103A\u1021\u101B\u1031\u1021\u1010\u103D\u1000\u103A]</code>
 \u1025\u1015\u1019\u102C\u1019\u103B\u102C\u1038:
-\u2022 <code>/gen KoAung 1m 1</code>
-\u2022 <code>/gen DawHla 3m 2</code>
-\u2022 <code>/gen 09798111222 1y 1</code>
-\u2022 <code>/gen Engineer_U_Kyaw life 2</code>
+\u2022 <code>/gen Ko Aung 1w 1</code> (\u1041 \u1015\u1010\u103A - \u1047 \u101B\u1000\u103A)
+\u2022 <code>/gen Ko Aung 1m 1</code> (\u1041 \u101C - \u1043\u1040 \u101B\u1000\u103A)
+\u2022 <code>/gen Daw Hla 3m 2</code> (\u1043 \u101C - \u1049\u1040 \u101B\u1000\u103A)
+\u2022 <code>/gen 09798111222 1y 1</code> (\u1041 \u1014\u103E\u1005\u103A - \u1043\u1046\u1045 \u101B\u1000\u103A)
+\u2022 <code>/gen Engineer U Kyaw life 2</code> (\u1010\u1005\u103A\u101E\u1000\u103A\u1010\u102C)
 
-\u23F3 <b>\u101E\u1000\u103A\u1010\u1019\u103A\u1038 \u1021\u1010\u102D\u102F\u1000\u1031\u102C\u1000\u103A\u1019\u103B\u102C\u1038:</b>
-\u2022 <code>1w</code> = 1 Week (\u1047 \u101B\u1000\u103A)
-\u2022 <code>1m</code> = 1 Month (\u101B\u1000\u103A \u1043\u1040)
-\u2022 <code>3m</code> = 3 Months (\u101B\u1000\u103A \u1049\u1040)
-\u2022 <code>6m</code> = 6 Months (\u1041\u1048\u1040 \u101B\u1000\u103A)
-\u2022 <code>1y</code> = 1 Year (\u1043\u1046\u1045 \u101B\u1000\u103A)
-\u2022 <code>life</code> = Lifetime (\u1041\u1040 \u1014\u103E\u1005\u103A)
+\u26A1\uFE0F <b>\u1021\u1019\u103C\u1014\u103A\u1011\u102F\u1010\u103A\u1014\u100A\u103A\u1038 (Quick Commands):</b>
+\u2022 <code>/1w Ko Aung 1</code> \u2014 1 Week (\u1047 \u101B\u1000\u103A)
+\u2022 <code>/1m Ko Aung 1</code> \u2014 1 Month (\u101B\u1000\u103A \u1043\u1040)
+\u2022 <code>/3m Ko Aung 2</code> \u2014 3 Months (\u101B\u1000\u103A \u1049\u1040)
+\u2022 <code>/6m Ko Aung 2</code> \u2014 6 Months (\u1041\u1048\u1040 \u101B\u1000\u103A)
+\u2022 <code>/1y Ko Aung 1</code> \u2014 1 Year (\u1043\u1046\u1045 \u101B\u1000\u103A)
+\u2022 <code>/life Ko Aung 2</code> \u2014 Lifetime (\u1041\u1040 \u1014\u103E\u1005\u103A)
 
 2\uFE0F\u20E3 <b>\u101C\u102D\u102F\u1004\u103A\u1005\u1004\u103A\u1019\u103B\u102C\u1038 \u1000\u103C\u100A\u1037\u103A\u101B\u1014\u103A & \u1012\u1031\u102B\u1004\u103A\u1038\u101C\u102F\u1012\u103A \u101B\u101A\u1030\u101B\u1014\u103A:</b>
 \u2022 <code>/licenses</code> - \u1014\u1031\u102C\u1000\u103A\u1006\u102F\u1036\u1038 \u1011\u102F\u1010\u103A\u1011\u102C\u1038\u101E\u1031\u102C \u1005\u102C\u101B\u1004\u103A\u1038\u1019\u103B\u102C\u1038
@@ -1802,66 +2103,85 @@ Bot \u1001\u103B\u102D\u1010\u103A\u1006\u1000\u103A\u1011\u102C\u1038\u101E\u10
     }
     return;
   }
-  if (cmd === "/gen" || cmd === "/generate") {
-    if (parts.length < 3) {
-      await sendTelegramMessage(cfg.botToken, chatId, `\u26A0\uFE0F <b>\u1021\u101E\u102F\u1036\u1038\u1015\u103C\u102F\u1015\u102F\u1036 \u1019\u103E\u102C\u1038\u101A\u103D\u1004\u103A\u1038\u1014\u1031\u1015\u102B\u101E\u100A\u103A!</b>
-\u1021\u1031\u102C\u1000\u103A\u1015\u102B \u1015\u102F\u1036\u1005\u1036\u1021\u1010\u102D\u102F\u1004\u103A\u1038 \u101B\u102D\u102F\u1000\u103A\u1011\u100A\u1037\u103A\u1015\u1031\u1038\u1015\u102B:
-<code>/gen &lt;\u1014\u102C\u1019\u100A\u103A&gt; &lt;\u101E\u1000\u103A\u1010\u1019\u103A\u1038&gt; [\u1005\u1000\u103A\u1021\u101B\u1031\u1021\u1010\u103D\u1000\u103A]</code>
-\u1025\u1015\u1019\u102C: <code>/gen KoAung 1m 1</code> \u101E\u102D\u102F\u1037\u1019\u101F\u102F\u1010\u103A <code>/gen DawMya 3m 2</code>`, "HTML");
+  const shorthandDurationMap = {
+    "/1w": "1_week",
+    "/1week": "1_week",
+    "/gen1w": "1_week",
+    "/gen_1w": "1_week",
+    "/1m": "1_month",
+    "/1month": "1_month",
+    "/gen1m": "1_month",
+    "/gen_1m": "1_month",
+    "/3m": "3_months",
+    "/3months": "3_months",
+    "/gen3m": "3_months",
+    "/gen_3m": "3_months",
+    "/6m": "6_months",
+    "/6months": "6_months",
+    "/gen6m": "6_months",
+    "/gen_6m": "6_months",
+    "/1y": "1_year",
+    "/1year": "1_year",
+    "/gen1y": "1_year",
+    "/gen_1y": "1_year",
+    "/life": "lifetime",
+    "/lifetime": "lifetime",
+    "/genlife": "lifetime",
+    "/gen_life": "lifetime"
+  };
+  const fixedDuration = shorthandDurationMap[cmd];
+  if (cmd === "/gen" || cmd === "/generate" || fixedDuration) {
+    const parsed = parseTelegramGenArgs(parts.slice(1), fixedDuration);
+    if (!parsed.duration) {
+      const pendingId = Math.random().toString(36).substring(2, 8);
+      const pendingName = parsed.customerName || "Engineer Customer";
+      const escapedPendingName = pendingName.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      pendingGenPrompts.set(pendingId, {
+        customerName: pendingName,
+        deviceLimit: parsed.deviceLimit,
+        createdAt: Date.now()
+      });
+      if (pendingGenPrompts.size > 200) {
+        const oldest = pendingGenPrompts.keys().next().value;
+        if (oldest) pendingGenPrompts.delete(oldest);
+      }
+      const warnMsg = parsed.customerName ? `\u23F3 <b>${escapedPendingName}</b> \u1021\u1010\u103D\u1000\u103A \u101E\u1000\u103A\u1010\u1019\u103A\u1038 (Duration) \u1000\u102D\u102F \u1021\u1031\u102C\u1000\u103A\u1015\u102B\u1001\u101C\u102F\u1010\u103A\u1019\u103B\u102C\u1038\u1019\u103E \u1010\u102D\u102F\u1000\u103A\u101B\u102D\u102F\u1000\u103A\u101B\u103D\u1031\u1038\u1001\u103B\u101A\u103A\u1014\u102D\u102F\u1004\u103A\u1015\u102B\u101E\u100A\u103A (\u101E\u102D\u102F\u1037\u1019\u101F\u102F\u1010\u103A <code>/gen ${escapedPendingName} 1w 1</code> \u1015\u102F\u1036\u1005\u1036\u1016\u103C\u1004\u1037\u103A \u101B\u102D\u102F\u1000\u103A\u1015\u102D\u102F\u1037\u1015\u102B):` : `\u26A0\uFE0F <b>\u101E\u1000\u103A\u1010\u1019\u103A\u1038 (1w / 1m / 3m / 6m / 1y / life) \u1000\u102D\u102F \u1011\u100A\u1037\u103A\u101E\u103D\u1004\u103A\u1038\u1015\u1031\u1038\u1015\u102B!</b>
+
+\u{1F4CC} <b>\u1025\u1015\u1019\u102C\u1019\u103B\u102C\u1038:</b>
+\u2022 <code>/gen Ko Aung 1w 1</code> (\u1041 \u1015\u1010\u103A)
+\u2022 <code>/gen Ko Aung 1m 1</code> (\u1041 \u101C)
+\u2022 <code>/gen Ko Aung 3m 2</code> (\u1043 \u101C - \u1042 \u101C\u102F\u1036\u1038)
+\u2022 <code>/gen Ko Aung 1y 1</code> (\u1041 \u1014\u103E\u1005\u103A)
+\u2022 <code>/1w Ko Aung</code> (\u1021\u1019\u103C\u1014\u103A\u1011\u102F\u1010\u103A\u1014\u100A\u103A\u1038)
+
+\u{1F447} \u101E\u102D\u102F\u1037\u1019\u101F\u102F\u1010\u103A \u1021\u1031\u102C\u1000\u103A\u1015\u102B\u1001\u101C\u102F\u1010\u103A\u1016\u103C\u1004\u1037\u103A \u1010\u102D\u102F\u1000\u103A\u101B\u102D\u102F\u1000\u103A\u1011\u102F\u1010\u103A\u1014\u102D\u102F\u1004\u103A\u1015\u102B\u101E\u100A\u103A:`;
+      await sendTelegramMessage(cfg.botToken, chatId, warnMsg, "HTML", {
+        inline_keyboard: [
+          [
+            { text: "\u{1F5D3} 1 Week (7d)", callback_data: `qgen:${pendingId}:1_week:${parsed.deviceLimit}` },
+            { text: "\u{1F5D3} 1 Month (30d)", callback_data: `qgen:${pendingId}:1_month:${parsed.deviceLimit}` }
+          ],
+          [
+            { text: "\u{1F5D3} 3 Months (90d)", callback_data: `qgen:${pendingId}:3_months:${parsed.deviceLimit}` },
+            { text: "\u{1F5D3} 6 Months (180d)", callback_data: `qgen:${pendingId}:6_months:${parsed.deviceLimit}` }
+          ],
+          [
+            { text: "\u{1F5D3} 1 Year (365d)", callback_data: `qgen:${pendingId}:1_year:${parsed.deviceLimit}` },
+            { text: "\u267E Lifetime (10y)", callback_data: `qgen:${pendingId}:lifetime:${parsed.deviceLimit}` }
+          ]
+        ]
+      });
       return;
     }
-    const customerName = parts[1];
-    const durRaw = parts[2].toLowerCase();
-    const devLimitRaw = parts[3] ? parseInt(parts[3], 10) : 1;
-    const deviceLimit = devLimitRaw === 2 ? 2 : 1;
-    let duration = "1_month";
-    if (durRaw === "1w" || durRaw === "1week") duration = "1_week";
-    else if (durRaw === "1m" || durRaw === "1month") duration = "1_month";
-    else if (durRaw === "3m" || durRaw === "3months") duration = "3_months";
-    else if (durRaw === "6m" || durRaw === "6months") duration = "6_months";
-    else if (durRaw === "1y" || durRaw === "1year") duration = "1_year";
-    else if (durRaw === "life" || durRaw === "lifetime") duration = "lifetime";
-    const dedupKey = `${chatId}_${customerName.toLowerCase()}_${duration}_${deviceLimit}`;
-    const recent = recentCommandCache.get(dedupKey);
-    let newLic;
-    let isDuplicate = false;
-    if (recent && Date.now() - recent.time < 2e4) {
-      newLic = recent.license;
-      isDuplicate = true;
-    } else {
-      await pullAndMergeLicensesFromSupabase();
-      newLic = generateLicenseRecord(customerName, duration, deviceLimit, `Generated via Telegram Bot (@${msg.from?.username || fromName})`);
-      recentCommandCache.set(dedupKey, { time: Date.now(), license: newLic });
-      if (recentCommandCache.size > 200) {
-        const oldest = recentCommandCache.keys().next().value;
-        if (oldest) recentCommandCache.delete(oldest);
-      }
-    }
-    const activationLink = `${appUrl}/?license=${newLic.token}`;
-    const durLabel = duration === "1_week" ? "1 Week (7 Days)" : duration === "1_month" ? "1 Month (30 Days)" : duration === "3_months" ? "3 Months (90 Days)" : duration === "6_months" ? "6 Months (180 Days)" : duration === "1_year" ? "1 Year (365 Days)" : "Lifetime (10 Years)";
-    const dupNotice = isDuplicate ? "\u26A0\uFE0F <i>(\u101C\u103D\u1014\u103A\u1001\u1032\u1037\u101E\u1031\u102C \u1005\u1000\u1039\u1000\u1014\u1037\u103A\u1015\u102D\u102F\u1004\u103A\u1038\u1000 \u1011\u102F\u1010\u103A\u1011\u102C\u1038\u1015\u103C\u102E\u1038\u1016\u103C\u1005\u103A\u101E\u1031\u102C \u101C\u102D\u102F\u1004\u103A\u1005\u1004\u103A\u1021\u102C\u1038 \u1015\u103C\u1014\u103A\u101C\u100A\u103A\u1015\u103C\u101E\u1015\u1031\u1038\u1011\u102C\u1038\u1015\u102B\u101E\u100A\u103A - Duplicate Prevented)</i>\n\n" : "";
-    const replyMsg = `${dupNotice}\u{1F389} <b>PRO LICENSE \u1011\u102F\u1010\u103A\u101C\u102F\u1015\u103A\u1015\u103C\u102E\u1038\u1015\u102B\u1015\u103C\u102E!</b> \u26A1\uFE0F
-\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
-\u{1F464} <b>\u101D\u101A\u103A\u101A\u1030\u101E\u1030:</b> ${customerName}
-\u23F3 <b>\u101E\u1000\u103A\u1010\u1019\u103A\u1038:</b> ${durLabel}
-\u{1F4F1} <b>\u1001\u103D\u1004\u1037\u103A\u1015\u103C\u102F\u1005\u1000\u103A:</b> ${newLic.deviceLimit} Device(s)
-
-\u{1F310} <b>VPN \u1019\u101C\u102D\u102F\u1018\u1032 \u1010\u102D\u102F\u1000\u103A\u101B\u102D\u102F\u1000\u103A\u1016\u103D\u1004\u1037\u103A\u101B\u1014\u103A (One-Click Link):</b>
-${activationLink}
-
-\u{1F511} <b>License Key:</b>
-<code>${newLic.token}</code>
-<i>\u{1F449} \u1021\u1000\u101A\u103A\u104D Link \u1019\u1016\u103D\u1004\u1037\u103A\u1001\u103B\u1004\u103A\u1015\u102B\u1000 App \u104F "Enter License Key" \u1010\u103D\u1004\u103A \u1024 Key \u1000\u102D\u102F \u1000\u1030\u1038\u1011\u100A\u1037\u103A\u101B\u102F\u1036\u1016\u103C\u1004\u1037\u103A\u101C\u100A\u103A\u1038 VPN \u1019\u101C\u102D\u102F\u1018\u1032 Activate \u1016\u103C\u1005\u103A\u1015\u102B\u101E\u100A\u103A!</i>
-\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501
-<i>(\u101D\u101A\u103A\u101A\u1030\u101E\u1030\u1011\u1036 \u1024\u1005\u102C\u1010\u102D\u102F\u1000\u102D\u102F \u1010\u102D\u102F\u1000\u103A\u101B\u102D\u102F\u1000\u103A Forward \u1015\u102D\u102F\u1037\u1015\u1031\u1038\u101C\u102D\u102F\u1000\u103A\u101B\u102F\u1036\u1016\u103C\u1004\u1037\u103A \u1021\u101C\u103D\u101A\u103A\u1010\u1000\u1030 Activate \u1015\u103C\u102F\u101C\u102F\u1015\u103A\u1014\u102D\u102F\u1004\u103A\u1015\u102B\u101E\u100A\u103A)</i>`;
-    await sendTelegramMessage(cfg.botToken, chatId, replyMsg, "HTML", {
-      inline_keyboard: [
-        [
-          { text: "\u26A1\uFE0F 1-Click Activate PRO", url: activationLink },
-          { text: "\u2600\uFE0F Open App", url: appUrl }
-        ]
-      ]
-    });
+    const fromLabel = msg.from?.username ? `@${msg.from.username}` : fromName;
+    await generateAndSendTelegramLicense(
+      cfg,
+      chatId,
+      fromLabel,
+      parsed.customerName || "Engineer Customer",
+      parsed.duration,
+      parsed.deviceLimit
+    );
     return;
   }
   if (cmd === "/licenses") {
@@ -1922,8 +2242,8 @@ ${activationLink}
   await sendTelegramMessage(
     cfg.botToken,
     chatId,
-    `\u{1F4A1} \u101C\u102D\u102F\u1004\u103A\u1005\u1004\u103A\u1011\u102F\u1010\u103A\u101A\u1030\u101B\u1014\u103A <code>/gen &lt;\u1014\u102C\u1019\u100A\u103A&gt; &lt;\u101E\u1000\u103A\u1010\u1019\u103A\u1038&gt; [\u1005\u1000\u103A\u1021\u101B\u1031\u1021\u1010\u103D\u1000\u103A]</code> \u101F\u102F \u101B\u102D\u102F\u1000\u103A\u1015\u102D\u102F\u1037\u1015\u102B\u1001\u1004\u103A\u1017\u103B\u102C\u104B
-\u1025\u1015\u1019\u102C: <code>/gen KoAung 1m 1</code>
+    `\u{1F4A1} \u101C\u102D\u102F\u1004\u103A\u1005\u1004\u103A\u1011\u102F\u1010\u103A\u101A\u1030\u101B\u1014\u103A <code>/gen &lt;\u1014\u102C\u1019\u100A\u103A&gt; &lt;1w|1m|3m|6m|1y|life&gt; [1|2]</code> \u101F\u102F \u101B\u102D\u102F\u1000\u103A\u1015\u102D\u102F\u1037\u1015\u102B\u1001\u1004\u103A\u1017\u103B\u102C\u104B
+\u1025\u1015\u1019\u102C: <code>/gen Ko Aung 1w 1</code> \u101E\u102D\u102F\u1037\u1019\u101F\u102F\u1010\u103A <code>/1w Ko Aung 1</code>
 \u{1F310} App Link \u101B\u101A\u1030\u101B\u1014\u103A <code>/app</code> \u101F\u102F \u1015\u102D\u102F\u1037\u1015\u1031\u1038\u1015\u102B\u104B`,
     "HTML",
     {
@@ -2035,8 +2355,12 @@ app.post("/api/telegram/sync-menu", async (req, res) => {
 app.post("/api/telegram/webhook", async (req, res) => {
   try {
     const cfg = memoryStorage["telegram_bot"];
-    if (cfg && cfg.enabled && req.body && req.body.message) {
-      await handleTelegramIncomingMessage(cfg, req.body.message);
+    if (cfg && cfg.enabled && req.body) {
+      if (req.body.message) {
+        await handleTelegramIncomingMessage(cfg, req.body.message);
+      } else if (req.body.callback_query) {
+        await handleTelegramCallbackQuery(cfg, req.body.callback_query);
+      }
     }
     res.json({ ok: true });
   } catch (err) {
