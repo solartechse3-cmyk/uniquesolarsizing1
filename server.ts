@@ -35,13 +35,36 @@ function broadcastSSE(type: string, data: any) {
 const DEFAULT_SUPABASE_URL = "https://vkiwylrerryidoiyqeqh.supabase.co";
 const DEFAULT_SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZraXd5bHJlcnJ5aWRvaXlxZXFoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODcxNDE3NDMsImV4cCI6MjEwMjcxNzc0M30.skGou_-7bKiDdW4lhfEqkywHzvj3mZT9-N_PTED7Rtc";
 
+function normalizeServerSupabaseUrl(rawUrl?: string): string {
+  const cleaned = String(rawUrl || "").trim();
+  if (!cleaned) return DEFAULT_SUPABASE_URL;
+  const dashboardMatch = cleaned.match(/supabase\.com\/dashboard\/project\/([a-z0-9_\-]+)/i);
+  if (dashboardMatch && dashboardMatch[1]) {
+    return `https://${dashboardMatch[1]}.supabase.co`;
+  }
+  if (/^[a-z0-9_\-]{15,30}$/i.test(cleaned)) {
+    return `https://${cleaned}.supabase.co`;
+  }
+  if (/^https?:\/\/[a-z0-9_\-]+\.supabase\.co(\/.*)?$/i.test(cleaned)) {
+    return cleaned.replace(/\/+$/, "").replace(/(\.supabase\.co)\/.*$/i, "$1");
+  }
+  return DEFAULT_SUPABASE_URL;
+}
+
+function isValidServerSupabaseAnonKey(rawKey?: string): boolean {
+  const k = String(rawKey || "").trim();
+  if (!k || k.length < 30) return false;
+  if (/^https?:\/\//i.test(k) || k.includes("supabase.com/dashboard")) return false;
+  return k.startsWith("eyJ") || k.startsWith("sb_publishable_") || k.startsWith("sb_secret_");
+}
+
 function getSupabaseRestConfig(): { url: string; anonKey: string } {
   const storedCfg = memoryStorage?.["supabase_config"];
-  const rawUrl = (storedCfg?.url || process.env.VITE_SUPABASE_URL || DEFAULT_SUPABASE_URL).trim();
-  const anonKey = (storedCfg?.anonKey || process.env.VITE_SUPABASE_ANON_KEY || DEFAULT_SUPABASE_ANON_KEY).trim();
+  const candidateUrl = storedCfg?.url || process.env.VITE_SUPABASE_URL || DEFAULT_SUPABASE_URL;
+  const candidateKey = storedCfg?.anonKey || process.env.VITE_SUPABASE_ANON_KEY || DEFAULT_SUPABASE_ANON_KEY;
   return {
-    url: rawUrl.replace(/\/+$/, ""),
-    anonKey
+    url: normalizeServerSupabaseUrl(candidateUrl),
+    anonKey: isValidServerSupabaseAnonKey(candidateKey) ? String(candidateKey).trim() : DEFAULT_SUPABASE_ANON_KEY
   };
 }
 
@@ -1333,33 +1356,100 @@ function parseTelegramGenArgs(
   return { customerName, duration, deviceLimit };
 }
 
+type CanonicalLicenseDuration = '1_week' | '1_month' | '3_months' | '6_months' | '1_year' | 'lifetime';
+
+const LICENSE_PLAN_SPECS: Record<CanonicalLicenseDuration, {
+  code: '1W' | '1M' | '3M' | '6M' | '1Y' | 'LIFE';
+  days: number;
+  labelEn: string;
+  labelMy: string;
+}> = {
+  '1_week': { code: '1W', days: 7, labelEn: '1 Week (7 Days)', labelMy: '၁ ပတ် (၇ ရက်)' },
+  '1_month': { code: '1M', days: 30, labelEn: '1 Month (30 Days)', labelMy: '၁ လ (ရက် ၃၀)' },
+  '3_months': { code: '3M', days: 90, labelEn: '3 Months (90 Days)', labelMy: '၃ လ (ရက် ၉၀)' },
+  '6_months': { code: '6M', days: 180, labelEn: '6 Months (180 Days)', labelMy: '၆ လ (၁၈၀ ရက်)' },
+  '1_year': { code: '1Y', days: 365, labelEn: '1 Year (365 Days)', labelMy: '၁ နှစ် (၃၆၅ ရက်)' },
+  'lifetime': { code: 'LIFE', days: 3650, labelEn: 'Lifetime (10 Years)', labelMy: 'တစ်သက်တာ (၁၀ နှစ်)' }
+};
+
+const LICENSE_CODE_TO_DURATION: Record<string, CanonicalLicenseDuration> = {
+  '1W': '1_week',
+  '1M': '1_month',
+  '3M': '3_months',
+  '6M': '6_months',
+  '1Y': '1_year',
+  'LIFE': 'lifetime'
+};
+
+function randomKeySegment(len: number = 4): string {
+  // Exclude confusing characters (0, O, 1, I) so buyers never mistype keys
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let out = '';
+  for (let i = 0; i < len; i++) {
+    out += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return out;
+}
+
+function extractCanonicalLicenseToken(rawInput: string): string {
+  const str = String(rawInput || '').trim();
+  const tokenMatch = str.match(/SOLAR-PRO-(1W|1M|3M|6M|1Y|LIFE)-(1D|2D)-[A-Z0-9]{4}-[A-Z0-9]{4}/i);
+  if (tokenMatch) return tokenMatch[0].toUpperCase();
+  const paramMatch = str.match(/[?&]license=([A-Za-z0-9_-]+)/i);
+  if (paramMatch && paramMatch[1]) return paramMatch[1].toUpperCase();
+  return str.toUpperCase();
+}
+
+function normalizeServerLicenseRecord(lic: any): any {
+  if (!lic || typeof lic !== 'object' || !lic.token) return lic;
+  const tokenStr = String(lic.token).trim().toUpperCase();
+  const match = tokenStr.match(/^SOLAR-PRO-(1W|1M|3M|6M|1Y|LIFE)-(1D|2D)-[A-Z0-9]{4}-[A-Z0-9]{4}$/i);
+  if (!match) return lic;
+  const expectedDuration = LICENSE_CODE_TO_DURATION[match[1].toUpperCase()];
+  const expectedDevLimit: 1 | 2 = match[2].toUpperCase() === '2D' ? 2 : 1;
+  if (!expectedDuration) return lic;
+  const spec = LICENSE_PLAN_SPECS[expectedDuration];
+  const currentDuration = parseDurationToken(lic.duration);
+  const fixed: any = {
+    ...lic,
+    token: tokenStr,
+    duration: expectedDuration,
+    durationDays: spec.days,
+    deviceLimit: expectedDevLimit
+  };
+  // Self-heal expiresAt ONLY if the record's duration mismatched its own token prefix (never overwrite genuine Admin extensions)
+  if (currentDuration !== expectedDuration && lic.createdAt && !lic.manuallyExtended) {
+    const createdMs = new Date(lic.createdAt).getTime();
+    if (!isNaN(createdMs)) {
+      fixed.expiresAt = new Date(createdMs + spec.days * 86400000).toISOString();
+    }
+  }
+  return fixed;
+}
+
 // Helper to generate a new PRO License Record (used by Web UI, API, and Telegram Bot)
 function generateLicenseRecord(customerName: string, duration?: string, deviceLimit: number = 1, note?: string) {
-  const d = parseDurationToken(duration) || '1_month';
-  let days = 30;
-  if (d === '1_week') days = 7;
-  else if (d === '1_month') days = 30;
-  else if (d === '3_months') days = 90;
-  else if (d === '6_months') days = 180;
-  else if (d === '1_year') days = 365;
-  else if (d === 'lifetime') days = 3650;
+  const d: CanonicalLicenseDuration = parseDurationToken(duration) || '1_month';
+  const spec = LICENSE_PLAN_SPECS[d];
+  const days = spec.days;
+  const safeDeviceLimit: 1 | 2 = Number(deviceLimit) === 2 ? 2 : 1;
 
-  const rand1 = (Math.random().toString(36).substring(2, 6) + 'ABCD').substring(0, 4).toUpperCase();
-  const rand2 = (Math.random().toString(36).substring(2, 6) + 'WXYZ').substring(0, 4).toUpperCase();
-  const durCode = d === '1_week' ? '1W' : d === '1_month' ? '1M' : d === '3_months' ? '3M' : d === '6_months' ? '6M' : d === '1_year' ? '1Y' : 'LIFE';
-  const devCode = deviceLimit === 2 ? '2D' : '1D';
+  const rand1 = randomKeySegment(4);
+  const rand2 = randomKeySegment(4);
+  const durCode = spec.code;
+  const devCode = safeDeviceLimit === 2 ? '2D' : '1D';
   const token = `SOLAR-PRO-${durCode}-${devCode}-${rand1}-${rand2}`;
 
   const now = new Date();
   const expires = new Date(now.getTime() + days * 86400000);
 
   const newLicense = {
-    id: `lic_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+    id: `lic_${Date.now()}_${randomKeySegment(4).toLowerCase()}`,
     token,
     customerName: (customerName || '').trim() || 'Engineer Customer',
     duration: d,
     durationDays: days,
-    deviceLimit: deviceLimit === 2 ? 2 : 1,
+    deviceLimit: safeDeviceLimit,
     boundDevices: [],
     createdAt: now.toISOString(),
     expiresAt: expires.toISOString(),
@@ -1400,8 +1490,8 @@ app.post("/api/license/activate", async (req, res) => {
       return res.status(400).json({ success: false, error: 'Token is required' });
     }
 
-    const cleanedToken = String(token).trim().toUpperCase();
-    let list = memoryStorage["licenses"] || [];
+    const cleanedToken = extractCanonicalLicenseToken(token);
+    let list = (memoryStorage["licenses"] || []).map(normalizeServerLicenseRecord);
     let licIndex = list.findIndex((l: any) => 
       l.token.toUpperCase() === cleanedToken || 
       l.id === cleanedToken ||
@@ -1409,7 +1499,7 @@ app.post("/api/license/activate", async (req, res) => {
     );
 
     if (licIndex === -1) {
-      list = await pullAndMergeLicensesFromSupabase();
+      list = (await pullAndMergeLicensesFromSupabase()).map(normalizeServerLicenseRecord);
       licIndex = list.findIndex((l: any) => 
         l.token.toUpperCase() === cleanedToken || 
         l.id === cleanedToken ||
@@ -1425,7 +1515,9 @@ app.post("/api/license/activate", async (req, res) => {
       });
     }
 
-    const lic = list[licIndex];
+    const lic = normalizeServerLicenseRecord(list[licIndex]);
+    list[licIndex] = lic;
+    memoryStorage["licenses"] = list;
     if (lic.status === 'revoked') {
       return res.status(403).json({ 
         success: false, 
@@ -1549,6 +1641,7 @@ app.post("/api/license/extend", async (req, res) => {
   const baseTime = currentExp > Date.now() ? currentExp : Date.now();
   lic.expiresAt = new Date(baseTime + addDays * 86400000).toISOString();
   lic.status = 'active';
+  lic.manuallyExtended = true;
 
   memoryStorage["licenses"] = list;
   saveStorageToDisk();
@@ -1847,12 +1940,21 @@ async function generateAndSendTelegramLicense(
   let newLic: any;
   let isDuplicate = false;
 
+  let cloudSynced = false;
   if (recent && (Date.now() - recent.time < 15000)) {
     newLic = recent.license;
     isDuplicate = true;
+    cloudSynced = true;
   } else {
     await pullAndMergeLicensesFromSupabase();
     newLic = generateLicenseRecord(safeName, duration, deviceLimit, `Generated via Telegram Bot (${fromLabel})`);
+    // Await Supabase Cloud persistence BEFORE sending key to Telegram so GitHub Pages activation works immediately!
+    cloudSynced = await upsertSupabaseAppSettings([
+      { id: "global_licenses", value: memoryStorage["licenses"], updated_at: new Date().toISOString() }
+    ]);
+    if (cloudSynced) {
+      broadcastSupabaseEvent("licenses_changed", { count: memoryStorage["licenses"].length, timestamp: Date.now() }).catch(() => {});
+    }
     recentCommandCache.set(dedupKey, { time: Date.now(), license: newLic });
     if (recentCommandCache.size > 200) {
       const oldest = recentCommandCache.keys().next().value;
@@ -1861,13 +1963,8 @@ async function generateAndSendTelegramLicense(
   }
 
   const activationLink = `${appUrl}/?license=${newLic.token}`;
-  const durLabel =
-    duration === '1_week' ? '1 Week (7 Days)' :
-    duration === '1_month' ? '1 Month (30 Days)' :
-    duration === '3_months' ? '3 Months (90 Days)' :
-    duration === '6_months' ? '6 Months (180 Days)' :
-    duration === '1_year' ? '1 Year (365 Days)' :
-    'Lifetime (10 Years)';
+  const planSpec = LICENSE_PLAN_SPECS[duration];
+  const durLabel = `${planSpec.labelEn} • ${planSpec.labelMy}`;
 
   const expiresDateStr = new Date(newLic.expiresAt).toLocaleDateString('en-US', {
     year: 'numeric',
@@ -1888,6 +1985,7 @@ async function generateAndSendTelegramLicense(
 ⏳ <b>သက်တမ်း:</b> ${durLabel}
 📅 <b>ကုန်ဆုံးမည့်ရက်:</b> ${expiresDateStr}
 📱 <b>ခွင့်ပြုစက်:</b> ${newLic.deviceLimit} Device(s)
+☁️ <b>Cloud Sync:</b> ${cloudSynced ? '✅ Ready (Online)' : '⚡️ Direct Offline-Ready'}
 
 🌐 <b>VPN မလိုဘဲ တိုက်ရိုက်ဖွင့်ရန် (One-Click Link):</b>
 ${activationLink}
@@ -2562,25 +2660,30 @@ app.post("/api/sheet-config", (req, res) => {
 
 // Supabase Cloud Configuration GET & POST
 app.get("/api/supabase-config", (req, res) => {
-  const cfg = memoryStorage["supabase_config"] || {
-    url: process.env.VITE_SUPABASE_URL || "",
-    anonKey: process.env.VITE_SUPABASE_ANON_KEY || "",
-    isConnected: Boolean(process.env.VITE_SUPABASE_URL && process.env.VITE_SUPABASE_ANON_KEY)
-  };
-  res.json({ success: true, config: cfg });
+  const { url, anonKey } = getSupabaseRestConfig();
+  res.json({
+    success: true,
+    config: {
+      url,
+      anonKey,
+      isConnected: Boolean(url && anonKey)
+    }
+  });
 });
 
 app.post("/api/supabase-config", (req, res) => {
   const { url, anonKey } = req.body;
+  const cleanUrl = normalizeServerSupabaseUrl(url);
+  const cleanKey = isValidServerSupabaseAnonKey(anonKey) ? String(anonKey).trim() : DEFAULT_SUPABASE_ANON_KEY;
   const cfg = {
-    url: (url || "").trim(),
-    anonKey: (anonKey || "").trim(),
-    isConnected: Boolean((url || "").trim() && (anonKey || "").trim())
+    url: cleanUrl,
+    anonKey: cleanKey,
+    isConnected: Boolean(cleanUrl && cleanKey)
   };
   memoryStorage["supabase_config"] = cfg;
   saveStorageToDisk();
 
-  // Also update .env file if it exists so builds inherit it
+  // Also update .env file if it exists so builds inherit clean credentials
   try {
     const envPath = path.join(process.cwd(), ".env");
     let envContent = fs.existsSync(envPath) ? fs.readFileSync(envPath, "utf-8") : "";

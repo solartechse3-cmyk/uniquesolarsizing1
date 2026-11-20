@@ -1006,16 +1006,24 @@ ${lic.token}
                   {/* Generated Result Modal Card */}
                   {generatedResult && (
                     <div className="p-4 rounded-2xl bg-slate-950 border border-amber-500/50 space-y-3">
-                      <div className="flex items-center justify-between">
+                      <div className="flex items-center justify-between flex-wrap gap-2">
                         <div className="flex items-center gap-2">
                           <CheckCircle2 className="w-5 h-5 text-emerald-400" />
                           <span className="font-extrabold text-sm text-white">
                             {lang === 'my' ? 'လိုင်စင် အောင်မြင်စွာ ထုတ်လုပ်ပြီးပါပြီ' : 'License Generated Successfully'}
                           </span>
                         </div>
-                        <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 font-bold">
-                          {generatedResult.deviceLimit} DEVICE ALLOWED
-                        </span>
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-300 font-bold">
+                            {generatedResult.duration.toUpperCase().replace('_', ' ')} ({generatedResult.durationDays}d)
+                          </span>
+                          <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 font-bold">
+                            Exp: {new Date(generatedResult.expiresAt).toLocaleDateString()}
+                          </span>
+                          <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 font-bold">
+                            {generatedResult.deviceLimit} DEVICE ALLOWED
+                          </span>
+                        </div>
                       </div>
 
                       {/* Link & Key display */}
@@ -1240,14 +1248,24 @@ ${lic.token}
                                 </button>
                               )}
 
-                              {/* Extend +30 Days */}
+                              {/* Extend +7 Days (1 Week) */}
+                              <button
+                                type="button"
+                                onClick={() => onExtendLicense(lic.id, 7)}
+                                className="px-2 py-1.5 rounded-lg bg-sky-600/20 hover:bg-sky-600/40 text-sky-300 text-[11px] font-bold cursor-pointer"
+                                title="Extend +7 Days (1 Week)"
+                              >
+                                +1W
+                              </button>
+
+                              {/* Extend +30 Days (1 Month) */}
                               <button
                                 type="button"
                                 onClick={() => onExtendLicense(lic.id, 30)}
                                 className="px-2 py-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/40 text-emerald-300 text-[11px] font-bold cursor-pointer"
-                                title="Extend +30 Days"
+                                title="Extend +30 Days (1 Month)"
                               >
-                                +1 Month
+                                +1M
                               </button>
 
                               {/* Revoke / Reactivate */}

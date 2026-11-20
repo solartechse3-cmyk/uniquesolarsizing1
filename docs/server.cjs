@@ -50,13 +50,34 @@ data: ${JSON.stringify({ type, data, timestamp: Date.now() })}
 }
 var DEFAULT_SUPABASE_URL = "https://vkiwylrerryidoiyqeqh.supabase.co";
 var DEFAULT_SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZraXd5bHJlcnJ5aWRvaXlxZXFoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODcxNDE3NDMsImV4cCI6MjEwMjcxNzc0M30.skGou_-7bKiDdW4lhfEqkywHzvj3mZT9-N_PTED7Rtc";
+function normalizeServerSupabaseUrl(rawUrl) {
+  const cleaned = String(rawUrl || "").trim();
+  if (!cleaned) return DEFAULT_SUPABASE_URL;
+  const dashboardMatch = cleaned.match(/supabase\.com\/dashboard\/project\/([a-z0-9_\-]+)/i);
+  if (dashboardMatch && dashboardMatch[1]) {
+    return `https://${dashboardMatch[1]}.supabase.co`;
+  }
+  if (/^[a-z0-9_\-]{15,30}$/i.test(cleaned)) {
+    return `https://${cleaned}.supabase.co`;
+  }
+  if (/^https?:\/\/[a-z0-9_\-]+\.supabase\.co(\/.*)?$/i.test(cleaned)) {
+    return cleaned.replace(/\/+$/, "").replace(/(\.supabase\.co)\/.*$/i, "$1");
+  }
+  return DEFAULT_SUPABASE_URL;
+}
+function isValidServerSupabaseAnonKey(rawKey) {
+  const k = String(rawKey || "").trim();
+  if (!k || k.length < 30) return false;
+  if (/^https?:\/\//i.test(k) || k.includes("supabase.com/dashboard")) return false;
+  return k.startsWith("eyJ") || k.startsWith("sb_publishable_") || k.startsWith("sb_secret_");
+}
 function getSupabaseRestConfig() {
   const storedCfg = memoryStorage?.["supabase_config"];
-  const rawUrl = (storedCfg?.url || process.env.VITE_SUPABASE_URL || DEFAULT_SUPABASE_URL).trim();
-  const anonKey = (storedCfg?.anonKey || process.env.VITE_SUPABASE_ANON_KEY || DEFAULT_SUPABASE_ANON_KEY).trim();
+  const candidateUrl = storedCfg?.url || process.env.VITE_SUPABASE_URL || DEFAULT_SUPABASE_URL;
+  const candidateKey = storedCfg?.anonKey || process.env.VITE_SUPABASE_ANON_KEY || DEFAULT_SUPABASE_ANON_KEY;
   return {
-    url: rawUrl.replace(/\/+$/, ""),
-    anonKey
+    url: normalizeServerSupabaseUrl(candidateUrl),
+    anonKey: isValidServerSupabaseAnonKey(candidateKey) ? String(candidateKey).trim() : DEFAULT_SUPABASE_ANON_KEY
   };
 }
 async function upsertSupabaseAppSettings(rows) {
@@ -1290,29 +1311,82 @@ function parseTelegramGenArgs(rawArgs, fixedDuration) {
   const customerName = nameTokens.join(" ").trim();
   return { customerName, duration, deviceLimit };
 }
+var LICENSE_PLAN_SPECS = {
+  "1_week": { code: "1W", days: 7, labelEn: "1 Week (7 Days)", labelMy: "\u1041 \u1015\u1010\u103A (\u1047 \u101B\u1000\u103A)" },
+  "1_month": { code: "1M", days: 30, labelEn: "1 Month (30 Days)", labelMy: "\u1041 \u101C (\u101B\u1000\u103A \u1043\u1040)" },
+  "3_months": { code: "3M", days: 90, labelEn: "3 Months (90 Days)", labelMy: "\u1043 \u101C (\u101B\u1000\u103A \u1049\u1040)" },
+  "6_months": { code: "6M", days: 180, labelEn: "6 Months (180 Days)", labelMy: "\u1046 \u101C (\u1041\u1048\u1040 \u101B\u1000\u103A)" },
+  "1_year": { code: "1Y", days: 365, labelEn: "1 Year (365 Days)", labelMy: "\u1041 \u1014\u103E\u1005\u103A (\u1043\u1046\u1045 \u101B\u1000\u103A)" },
+  "lifetime": { code: "LIFE", days: 3650, labelEn: "Lifetime (10 Years)", labelMy: "\u1010\u1005\u103A\u101E\u1000\u103A\u1010\u102C (\u1041\u1040 \u1014\u103E\u1005\u103A)" }
+};
+var LICENSE_CODE_TO_DURATION = {
+  "1W": "1_week",
+  "1M": "1_month",
+  "3M": "3_months",
+  "6M": "6_months",
+  "1Y": "1_year",
+  "LIFE": "lifetime"
+};
+function randomKeySegment(len = 4) {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let out = "";
+  for (let i = 0; i < len; i++) {
+    out += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return out;
+}
+function extractCanonicalLicenseToken(rawInput) {
+  const str = String(rawInput || "").trim();
+  const tokenMatch = str.match(/SOLAR-PRO-(1W|1M|3M|6M|1Y|LIFE)-(1D|2D)-[A-Z0-9]{4}-[A-Z0-9]{4}/i);
+  if (tokenMatch) return tokenMatch[0].toUpperCase();
+  const paramMatch = str.match(/[?&]license=([A-Za-z0-9_-]+)/i);
+  if (paramMatch && paramMatch[1]) return paramMatch[1].toUpperCase();
+  return str.toUpperCase();
+}
+function normalizeServerLicenseRecord(lic) {
+  if (!lic || typeof lic !== "object" || !lic.token) return lic;
+  const tokenStr = String(lic.token).trim().toUpperCase();
+  const match = tokenStr.match(/^SOLAR-PRO-(1W|1M|3M|6M|1Y|LIFE)-(1D|2D)-[A-Z0-9]{4}-[A-Z0-9]{4}$/i);
+  if (!match) return lic;
+  const expectedDuration = LICENSE_CODE_TO_DURATION[match[1].toUpperCase()];
+  const expectedDevLimit = match[2].toUpperCase() === "2D" ? 2 : 1;
+  if (!expectedDuration) return lic;
+  const spec = LICENSE_PLAN_SPECS[expectedDuration];
+  const currentDuration = parseDurationToken(lic.duration);
+  const fixed = {
+    ...lic,
+    token: tokenStr,
+    duration: expectedDuration,
+    durationDays: spec.days,
+    deviceLimit: expectedDevLimit
+  };
+  if (currentDuration !== expectedDuration && lic.createdAt && !lic.manuallyExtended) {
+    const createdMs = new Date(lic.createdAt).getTime();
+    if (!isNaN(createdMs)) {
+      fixed.expiresAt = new Date(createdMs + spec.days * 864e5).toISOString();
+    }
+  }
+  return fixed;
+}
 function generateLicenseRecord(customerName, duration, deviceLimit = 1, note) {
   const d = parseDurationToken(duration) || "1_month";
-  let days = 30;
-  if (d === "1_week") days = 7;
-  else if (d === "1_month") days = 30;
-  else if (d === "3_months") days = 90;
-  else if (d === "6_months") days = 180;
-  else if (d === "1_year") days = 365;
-  else if (d === "lifetime") days = 3650;
-  const rand1 = (Math.random().toString(36).substring(2, 6) + "ABCD").substring(0, 4).toUpperCase();
-  const rand2 = (Math.random().toString(36).substring(2, 6) + "WXYZ").substring(0, 4).toUpperCase();
-  const durCode = d === "1_week" ? "1W" : d === "1_month" ? "1M" : d === "3_months" ? "3M" : d === "6_months" ? "6M" : d === "1_year" ? "1Y" : "LIFE";
-  const devCode = deviceLimit === 2 ? "2D" : "1D";
+  const spec = LICENSE_PLAN_SPECS[d];
+  const days = spec.days;
+  const safeDeviceLimit = Number(deviceLimit) === 2 ? 2 : 1;
+  const rand1 = randomKeySegment(4);
+  const rand2 = randomKeySegment(4);
+  const durCode = spec.code;
+  const devCode = safeDeviceLimit === 2 ? "2D" : "1D";
   const token = `SOLAR-PRO-${durCode}-${devCode}-${rand1}-${rand2}`;
   const now = /* @__PURE__ */ new Date();
   const expires = new Date(now.getTime() + days * 864e5);
   const newLicense = {
-    id: `lic_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+    id: `lic_${Date.now()}_${randomKeySegment(4).toLowerCase()}`,
     token,
     customerName: (customerName || "").trim() || "Engineer Customer",
     duration: d,
     durationDays: days,
-    deviceLimit: deviceLimit === 2 ? 2 : 1,
+    deviceLimit: safeDeviceLimit,
     boundDevices: [],
     createdAt: now.toISOString(),
     expiresAt: expires.toISOString(),
@@ -1344,13 +1418,13 @@ app.post("/api/license/activate", async (req, res) => {
     if (!token) {
       return res.status(400).json({ success: false, error: "Token is required" });
     }
-    const cleanedToken = String(token).trim().toUpperCase();
-    let list = memoryStorage["licenses"] || [];
+    const cleanedToken = extractCanonicalLicenseToken(token);
+    let list = (memoryStorage["licenses"] || []).map(normalizeServerLicenseRecord);
     let licIndex = list.findIndex(
       (l) => l.token.toUpperCase() === cleanedToken || l.id === cleanedToken || cleanedToken.includes(l.token.toUpperCase())
     );
     if (licIndex === -1) {
-      list = await pullAndMergeLicensesFromSupabase();
+      list = (await pullAndMergeLicensesFromSupabase()).map(normalizeServerLicenseRecord);
       licIndex = list.findIndex(
         (l) => l.token.toUpperCase() === cleanedToken || l.id === cleanedToken || cleanedToken.includes(l.token.toUpperCase())
       );
@@ -1362,7 +1436,9 @@ app.post("/api/license/activate", async (req, res) => {
         message: "\u101C\u102D\u102F\u1004\u103A\u1005\u1004\u103A\u1000\u102F\u1012\u103A \u1019\u103E\u102C\u1038\u101A\u103D\u1004\u103A\u1038\u1014\u1031\u1015\u102B\u101E\u100A\u103A\u104B Viber \u101E\u102D\u102F\u1037\u1019\u101F\u102F\u1010\u103A Telegram \u1010\u103D\u1004\u103A Admin \u1021\u102C\u1038 \u1006\u1000\u103A\u101E\u103D\u101A\u103A\u1015\u102B (Invalid License Key)"
       });
     }
-    const lic = list[licIndex];
+    const lic = normalizeServerLicenseRecord(list[licIndex]);
+    list[licIndex] = lic;
+    memoryStorage["licenses"] = list;
     if (lic.status === "revoked") {
       return res.status(403).json({
         success: false,
@@ -1475,6 +1551,7 @@ app.post("/api/license/extend", async (req, res) => {
   const baseTime = currentExp > Date.now() ? currentExp : Date.now();
   lic.expiresAt = new Date(baseTime + addDays * 864e5).toISOString();
   lic.status = "active";
+  lic.manuallyExtended = true;
   memoryStorage["licenses"] = list;
   saveStorageToDisk();
   broadcastSSE("licenses", memoryStorage["licenses"]);
@@ -1729,12 +1806,21 @@ async function generateAndSendTelegramLicense(cfg, chatId, fromLabel, customerNa
   const recent = recentCommandCache.get(dedupKey);
   let newLic;
   let isDuplicate = false;
+  let cloudSynced = false;
   if (recent && Date.now() - recent.time < 15e3) {
     newLic = recent.license;
     isDuplicate = true;
+    cloudSynced = true;
   } else {
     await pullAndMergeLicensesFromSupabase();
     newLic = generateLicenseRecord(safeName, duration, deviceLimit, `Generated via Telegram Bot (${fromLabel})`);
+    cloudSynced = await upsertSupabaseAppSettings([
+      { id: "global_licenses", value: memoryStorage["licenses"], updated_at: (/* @__PURE__ */ new Date()).toISOString() }
+    ]);
+    if (cloudSynced) {
+      broadcastSupabaseEvent("licenses_changed", { count: memoryStorage["licenses"].length, timestamp: Date.now() }).catch(() => {
+      });
+    }
     recentCommandCache.set(dedupKey, { time: Date.now(), license: newLic });
     if (recentCommandCache.size > 200) {
       const oldest = recentCommandCache.keys().next().value;
@@ -1742,7 +1828,8 @@ async function generateAndSendTelegramLicense(cfg, chatId, fromLabel, customerNa
     }
   }
   const activationLink = `${appUrl}/?license=${newLic.token}`;
-  const durLabel = duration === "1_week" ? "1 Week (7 Days)" : duration === "1_month" ? "1 Month (30 Days)" : duration === "3_months" ? "3 Months (90 Days)" : duration === "6_months" ? "6 Months (180 Days)" : duration === "1_year" ? "1 Year (365 Days)" : "Lifetime (10 Years)";
+  const planSpec = LICENSE_PLAN_SPECS[duration];
+  const durLabel = `${planSpec.labelEn} \u2022 ${planSpec.labelMy}`;
   const expiresDateStr = new Date(newLic.expiresAt).toLocaleDateString("en-US", {
     year: "numeric",
     month: "short",
@@ -1756,6 +1843,7 @@ async function generateAndSendTelegramLicense(cfg, chatId, fromLabel, customerNa
 \u23F3 <b>\u101E\u1000\u103A\u1010\u1019\u103A\u1038:</b> ${durLabel}
 \u{1F4C5} <b>\u1000\u102F\u1014\u103A\u1006\u102F\u1036\u1038\u1019\u100A\u1037\u103A\u101B\u1000\u103A:</b> ${expiresDateStr}
 \u{1F4F1} <b>\u1001\u103D\u1004\u1037\u103A\u1015\u103C\u102F\u1005\u1000\u103A:</b> ${newLic.deviceLimit} Device(s)
+\u2601\uFE0F <b>Cloud Sync:</b> ${cloudSynced ? "\u2705 Ready (Online)" : "\u26A1\uFE0F Direct Offline-Ready"}
 
 \u{1F310} <b>VPN \u1019\u101C\u102D\u102F\u1018\u1032 \u1010\u102D\u102F\u1000\u103A\u101B\u102D\u102F\u1000\u103A\u1016\u103D\u1004\u1037\u103A\u101B\u1014\u103A (One-Click Link):</b>
 ${activationLink}
@@ -2385,19 +2473,24 @@ app.post("/api/sheet-config", (req, res) => {
   res.json({ success: true, config: cfg });
 });
 app.get("/api/supabase-config", (req, res) => {
-  const cfg = memoryStorage["supabase_config"] || {
-    url: process.env.VITE_SUPABASE_URL || "",
-    anonKey: process.env.VITE_SUPABASE_ANON_KEY || "",
-    isConnected: Boolean(process.env.VITE_SUPABASE_URL && process.env.VITE_SUPABASE_ANON_KEY)
-  };
-  res.json({ success: true, config: cfg });
+  const { url, anonKey } = getSupabaseRestConfig();
+  res.json({
+    success: true,
+    config: {
+      url,
+      anonKey,
+      isConnected: Boolean(url && anonKey)
+    }
+  });
 });
 app.post("/api/supabase-config", (req, res) => {
   const { url, anonKey } = req.body;
+  const cleanUrl = normalizeServerSupabaseUrl(url);
+  const cleanKey = isValidServerSupabaseAnonKey(anonKey) ? String(anonKey).trim() : DEFAULT_SUPABASE_ANON_KEY;
   const cfg = {
-    url: (url || "").trim(),
-    anonKey: (anonKey || "").trim(),
-    isConnected: Boolean((url || "").trim() && (anonKey || "").trim())
+    url: cleanUrl,
+    anonKey: cleanKey,
+    isConnected: Boolean(cleanUrl && cleanKey)
   };
   memoryStorage["supabase_config"] = cfg;
   saveStorageToDisk();

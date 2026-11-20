@@ -120,6 +120,13 @@ export function normalizeSupabaseUrl(rawUrl?: string): string {
   return `https://${cleaned}`.replace(/\/+$/, '');
 }
 
+export function isValidSupabaseAnonKey(rawKey?: string): boolean {
+  const k = String(rawKey || '').trim();
+  if (!k || k.length < 30) return false;
+  if (/^https?:\/\//i.test(k) || k.includes('supabase.com/dashboard')) return false;
+  return k.startsWith('eyJ') || k.startsWith('sb_publishable_') || k.startsWith('sb_secret_');
+}
+
 export function getSupabaseCredentials(): { url: string; anonKey: string } {
   let url = '';
   let anonKey = '';
@@ -132,30 +139,28 @@ export function getSupabaseCredentials(): { url: string; anonKey: string } {
     }
   } catch (e) {}
 
-  if (!url || !anonKey) {
+  if (!url || !isValidSupabaseAnonKey(anonKey)) {
     try {
       const stored = localStorage.getItem('solar_sizer_supabase_config');
       if (stored) {
         const parsed = JSON.parse(stored);
-        if (parsed.url && parsed.anonKey) {
-          url = parsed.url;
-          anonKey = parsed.anonKey;
-        }
+        if (parsed.url && !url) url = parsed.url;
+        if (isValidSupabaseAnonKey(parsed.anonKey)) anonKey = parsed.anonKey;
       }
     } catch (e) {}
   }
 
-  // Fallback to verified production cloud credentials (critical for static GitHub Pages)
-  if (!url) {
-    url = DEFAULT_SUPABASE_URL;
-  }
-  if (!anonKey) {
-    anonKey = DEFAULT_SUPABASE_ANON_KEY;
-  }
+  const normalizedUrl = normalizeSupabaseUrl(url);
+  const safeUrl = normalizedUrl && /\.supabase\.co$/i.test(normalizedUrl)
+    ? normalizedUrl
+    : DEFAULT_SUPABASE_URL;
+  const safeAnonKey = isValidSupabaseAnonKey(anonKey)
+    ? anonKey.trim()
+    : DEFAULT_SUPABASE_ANON_KEY;
 
-  return { 
-    url: normalizeSupabaseUrl(url), 
-    anonKey: anonKey.trim() 
+  return {
+    url: safeUrl,
+    anonKey: safeAnonKey
   };
 }
 
@@ -2350,12 +2355,128 @@ export const DEFAULT_ADMIN_CONTACT: AdminContactConfig = {
 const STORAGE_ADMIN_CONTACT_KEY = 'solar_sizer_admin_contact_v1';
 const STORAGE_ACTIVE_LICENSE_KEY = 'solar_sizer_active_license_v1';
 const STORAGE_ALL_LICENSES_KEY = 'solar_sizer_all_licenses_v1';
+const STORAGE_MANUAL_DEACTIVATED_KEY = 'solar_sizer_manual_deactivated_v1';
+
+export const LICENSE_PLAN_SPECS: Record<LicenseToken['duration'], {
+  code: '1W' | '1M' | '3M' | '6M' | '1Y' | 'LIFE';
+  days: number;
+  shortEn: string;
+  labelEn: string;
+  labelMy: string;
+}> = {
+  '1_week': { code: '1W', days: 7, shortEn: '1 WEEK', labelEn: '1 Week (7 Days)', labelMy: '၁ ပတ် (၇ ရက်)' },
+  '1_month': { code: '1M', days: 30, shortEn: '1 MONTH', labelEn: '1 Month (30 Days)', labelMy: '၁ လ (ရက် ၃၀)' },
+  '3_months': { code: '3M', days: 90, shortEn: '3 MONTHS', labelEn: '3 Months (90 Days)', labelMy: '၃ လ (ရက် ၉၀)' },
+  '6_months': { code: '6M', days: 180, shortEn: '6 MONTHS', labelEn: '6 Months (180 Days)', labelMy: '၆ လ (၁၈၀ ရက်)' },
+  '1_year': { code: '1Y', days: 365, shortEn: '1 YEAR', labelEn: '1 Year (365 Days)', labelMy: '၁ နှစ် (၃၆၅ ရက်)' },
+  'lifetime': { code: 'LIFE', days: 3650, shortEn: 'LIFETIME', labelEn: 'Lifetime (10 Years)', labelMy: 'တစ်သက်တာ (၁၀ နှစ်)' }
+};
+
+const CODE_TO_DURATION: Record<string, LicenseToken['duration']> = {
+  '1W': '1_week',
+  '1M': '1_month',
+  '3M': '3_months',
+  '6M': '6_months',
+  '1Y': '1_year',
+  'LIFE': 'lifetime'
+};
+
+function generateCleanKeySegment(len: number = 4): string {
+  // Exclude ambiguous characters (0, O, 1, I) so buyers never mistype keys
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let out = '';
+  for (let i = 0; i < len; i++) {
+    out += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return out;
+}
+
+export function extractLicenseTokenFromInput(rawInput: string): string {
+  const str = String(rawInput || '').trim();
+  const fullTokenMatch = str.match(/SOLAR-PRO-(1W|1M|3M|6M|1Y|LIFE)-(1D|2D)-[A-Z0-9]{4}-[A-Z0-9]{4}/i);
+  if (fullTokenMatch) {
+    return fullTokenMatch[0].toUpperCase();
+  }
+  const urlParamMatch = str.match(/[?&]license=([A-Za-z0-9_-]+)/i);
+  if (urlParamMatch && urlParamMatch[1]) {
+    return urlParamMatch[1].toUpperCase();
+  }
+  return str.toUpperCase();
+}
+
+export function normalizeLicenseRecord(lic: LicenseToken): LicenseToken {
+  if (!lic || !lic.token) return lic;
+  const cleanToken = String(lic.token).trim().toUpperCase();
+  const match = cleanToken.match(/^SOLAR-PRO-(1W|1M|3M|6M|1Y|LIFE)-(1D|2D)-[A-Z0-9]{4}-[A-Z0-9]{4}$/i);
+  if (!match) return lic;
+  const expectedDuration = CODE_TO_DURATION[match[1].toUpperCase()];
+  const expectedDeviceLimit: 1 | 2 = match[2].toUpperCase() === '2D' ? 2 : 1;
+  if (!expectedDuration) return lic;
+  const spec = LICENSE_PLAN_SPECS[expectedDuration];
+  const normalized: LicenseToken = {
+    ...lic,
+    token: cleanToken,
+    duration: expectedDuration,
+    durationDays: spec.days,
+    deviceLimit: expectedDeviceLimit
+  };
+  if (lic.duration !== expectedDuration && lic.createdAt && !lic.manuallyExtended) {
+    const createdMs = new Date(lic.createdAt).getTime();
+    if (!isNaN(createdMs)) {
+      normalized.expiresAt = new Date(createdMs + spec.days * 86400000).toISOString();
+    }
+  }
+  return normalized;
+}
+
+export function formatLicensePlanLabel(duration?: LicenseToken['duration'] | string, lang: 'en' | 'my' | 'zh' = 'my'): string {
+  const spec = duration ? (LICENSE_PLAN_SPECS as any)[duration] : null;
+  if (!spec) return lang === 'my' ? '၁ လ (ရက် ၃၀)' : '1 Month (30 Days)';
+  return lang === 'my' ? spec.labelMy : spec.labelEn;
+}
+
+export function formatLicenseRemainingLabel(expiresAt?: string, duration?: LicenseToken['duration'] | string, lang: 'en' | 'my' | 'zh' = 'my'): string {
+  if (duration === 'lifetime') {
+    return lang === 'my' ? 'တစ်သက်တာ (∞)' : 'Lifetime (∞)';
+  }
+  if (!expiresAt) return '';
+  const diff = new Date(expiresAt).getTime() - Date.now();
+  if (diff <= 0) return lang === 'my' ? 'သက်တမ်းကုန်' : 'Expired';
+  const days = Math.floor(diff / 86400000);
+  const hours = Math.floor((diff % 86400000) / 3600000);
+  const mins = Math.floor((diff % 3600000) / 60000);
+  if (days > 0) {
+    return lang === 'my' ? `${days} ရက် ${hours} နာရီကျန်` : `${days}d ${hours}h left`;
+  }
+  if (hours > 0) {
+    return lang === 'my' ? `${hours} နာရီ ${mins} မိနစ်ကျန်` : `${hours}h ${mins}m left`;
+  }
+  return lang === 'my' ? `${Math.max(1, mins)} မိနစ်ကျန်` : `${Math.max(1, mins)}m left`;
+}
+
+export function isLicenseManuallyDeactivated(): boolean {
+  try {
+    return localStorage.getItem(STORAGE_MANUAL_DEACTIVATED_KEY) === 'true';
+  } catch (e) {
+    return false;
+  }
+}
+
+export function setLicenseManuallyDeactivated(val: boolean) {
+  try {
+    if (val) {
+      localStorage.setItem(STORAGE_MANUAL_DEACTIVATED_KEY, 'true');
+    } else {
+      localStorage.removeItem(STORAGE_MANUAL_DEACTIVATED_KEY);
+    }
+  } catch (e) {}
+}
 
 export function getStoredActiveLicense(): LicenseToken | null {
   try {
     const raw = localStorage.getItem(STORAGE_ACTIVE_LICENSE_KEY);
     if (raw) {
-      const parsed = JSON.parse(raw);
+      const parsed = normalizeLicenseRecord(JSON.parse(raw));
       if (parsed && parsed.token && new Date(parsed.expiresAt).getTime() > Date.now() && parsed.status === 'active') {
         return parsed;
       }
@@ -2367,7 +2488,9 @@ export function getStoredActiveLicense(): LicenseToken | null {
 export function saveStoredActiveLicense(license: LicenseToken | null) {
   try {
     if (license) {
-      localStorage.setItem(STORAGE_ACTIVE_LICENSE_KEY, JSON.stringify(license));
+      const normalized = normalizeLicenseRecord(license);
+      localStorage.setItem(STORAGE_ACTIVE_LICENSE_KEY, JSON.stringify(normalized));
+      localStorage.removeItem(STORAGE_MANUAL_DEACTIVATED_KEY);
     } else {
       localStorage.removeItem(STORAGE_ACTIVE_LICENSE_KEY);
     }
@@ -2478,8 +2601,9 @@ export async function fetchLicensesFromCloud(): Promise<LicenseToken[]> {
         .maybeSingle();
 
       if (!error && data?.value && Array.isArray(data.value)) {
-        try { localStorage.setItem(STORAGE_ALL_LICENSES_KEY, JSON.stringify(data.value)); } catch (e) {}
-        return data.value;
+        const normalized = data.value.map((item: LicenseToken) => normalizeLicenseRecord(item));
+        try { localStorage.setItem(STORAGE_ALL_LICENSES_KEY, JSON.stringify(normalized)); } catch (e) {}
+        return normalized;
       }
     } catch (e) {}
   }
@@ -2490,8 +2614,9 @@ export async function fetchLicensesFromCloud(): Promise<LicenseToken[]> {
     if (res.ok) {
       const json = await res.json();
       if (json.success && Array.isArray(json.licenses)) {
-        try { localStorage.setItem(STORAGE_ALL_LICENSES_KEY, JSON.stringify(json.licenses)); } catch (e) {}
-        return json.licenses;
+        const normalized = json.licenses.map((item: LicenseToken) => normalizeLicenseRecord(item));
+        try { localStorage.setItem(STORAGE_ALL_LICENSES_KEY, JSON.stringify(normalized)); } catch (e) {}
+        return normalized;
       }
     }
   } catch (e) {}
@@ -2499,7 +2624,7 @@ export async function fetchLicensesFromCloud(): Promise<LicenseToken[]> {
   // 3. Local storage fallback
   try {
     const raw = localStorage.getItem(STORAGE_ALL_LICENSES_KEY);
-    if (raw) return JSON.parse(raw);
+    if (raw) return JSON.parse(raw).map((item: LicenseToken) => normalizeLicenseRecord(item));
   } catch (e) {}
 
   return [];
@@ -2560,48 +2685,52 @@ export async function generateLicenseOnServer(params: {
   note?: string;
 }): Promise<{ success: boolean; license?: LicenseToken; error?: string }> {
   let createdLicense: LicenseToken | null = null;
+  const requestedDuration: LicenseToken['duration'] =
+    (params.duration && (LICENSE_PLAN_SPECS as any)[params.duration]) ? params.duration : '1_month';
+  const requestedDeviceLimit: 1 | 2 = Number(params.deviceLimit) === 2 ? 2 : 1;
 
   try {
     const res = await fetch('/api/license/generate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(params)
+      body: JSON.stringify({
+        ...params,
+        duration: requestedDuration,
+        deviceLimit: requestedDeviceLimit
+      })
     });
     if (res.ok) {
       const json = await res.json();
       if (json.success && json.license) {
-        createdLicense = json.license;
+        const serverLic = normalizeLicenseRecord(json.license);
+        // Double-check server honored exact requested duration before accepting
+        if (serverLic.duration === requestedDuration) {
+          createdLicense = serverLic;
+        }
       }
     }
   } catch (e) {}
 
   // Fallback client generation if server route is not reachable (e.g. Admin on GitHub Pages)
   if (!createdLicense) {
-    const d = params.duration || '1_month';
-    let days = 30;
-    if (d === '1_week') days = 7;
-    else if (d === '1_month') days = 30;
-    else if (d === '3_months') days = 90;
-    else if (d === '6_months') days = 180;
-    else if (d === '1_year') days = 365;
-    else if (d === 'lifetime') days = 3650;
-
-    const rand1 = Math.random().toString(36).substring(2, 6).toUpperCase();
-    const rand2 = Math.random().toString(36).substring(2, 6).toUpperCase();
-    const durCode = d === '1_week' ? '1W' : d === '1_month' ? '1M' : d === '3_months' ? '3M' : d === '6_months' ? '6M' : d === '1_year' ? '1Y' : 'LIFE';
-    const devCode = params.deviceLimit === 2 ? '2D' : '1D';
+    const spec = LICENSE_PLAN_SPECS[requestedDuration];
+    const days = spec.days;
+    const rand1 = generateCleanKeySegment(4);
+    const rand2 = generateCleanKeySegment(4);
+    const durCode = spec.code;
+    const devCode = requestedDeviceLimit === 2 ? '2D' : '1D';
     const token = `SOLAR-PRO-${durCode}-${devCode}-${rand1}-${rand2}`;
 
     const now = new Date();
     const expires = new Date(now.getTime() + days * 86400000);
 
     createdLicense = {
-      id: `lic_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      id: `lic_${Date.now()}_${generateCleanKeySegment(4).toLowerCase()}`,
       token,
       customerName: params.customerName.trim() || 'Engineer Customer',
-      duration: d,
+      duration: requestedDuration,
       durationDays: days,
-      deviceLimit: params.deviceLimit === 2 ? 2 : 1,
+      deviceLimit: requestedDeviceLimit,
       boundDevices: [],
       createdAt: now.toISOString(),
       expiresAt: expires.toISOString(),
@@ -2612,7 +2741,7 @@ export async function generateLicenseOnServer(params: {
 
   // Always sync to Supabase `global_licenses` so all online devices see it immediately!
   const currentLicenses = await fetchLicensesFromCloud();
-  const updated = [createdLicense, ...currentLicenses.filter(l => l.id !== createdLicense!.id && l.token !== createdLicense!.token)];
+  const updated = [createdLicense, ...currentLicenses.filter(l => l.id !== createdLicense!.id && l.token.toUpperCase() !== createdLicense!.token.toUpperCase())];
   await saveLicensesToCloud(updated);
 
   return { success: true, license: createdLicense };
@@ -2626,7 +2755,9 @@ export async function activateLicenseOnDevice(token: string): Promise<{
 }> {
   const deviceId = getMyDeviceId();
   const deviceModel = getClientDevice();
-  const cleaned = token.trim().toUpperCase();
+  const cleaned = extractLicenseTokenFromInput(token);
+
+  setLicenseManuallyDeactivated(false);
 
   // 1. Primary Cloud Validation via Supabase `global_licenses` (works 100% online on GitHub Pages without VPN!)
   const supabase = initSupabase();
@@ -2639,7 +2770,7 @@ export async function activateLicenseOnDevice(token: string): Promise<{
         .maybeSingle();
 
       if (!error && Array.isArray(data?.value)) {
-        const list: LicenseToken[] = [...data.value];
+        const list: LicenseToken[] = data.value.map((item: LicenseToken) => normalizeLicenseRecord(item));
         const licIndex = list.findIndex(l =>
           l.token.toUpperCase() === cleaned ||
           l.id === cleaned ||
@@ -2647,7 +2778,7 @@ export async function activateLicenseOnDevice(token: string): Promise<{
         );
 
         if (licIndex !== -1) {
-          const lic = { ...list[licIndex] };
+          const lic = normalizeLicenseRecord({ ...list[licIndex] });
 
           if (lic.status === 'revoked') {
             return {
@@ -2670,12 +2801,14 @@ export async function activateLicenseOnDevice(token: string): Promise<{
 
           const bound = Array.isArray(lic.boundDevices) ? [...lic.boundDevices] : [];
           const existingIdx = bound.findIndex(b => b.deviceId === deviceId);
+          const nowIso = new Date().toISOString();
 
           if (existingIdx !== -1) {
             bound[existingIdx] = {
               ...bound[existingIdx],
               deviceModel,
-              lastSeenAt: new Date().toISOString()
+              activatedAt: nowIso,
+              lastSeenAt: nowIso
             };
             lic.boundDevices = bound;
             if (Array.isArray(lic.unboundDeviceIds)) {
@@ -2698,8 +2831,8 @@ export async function activateLicenseOnDevice(token: string): Promise<{
           bound.push({
             deviceId,
             deviceModel,
-            activatedAt: new Date().toISOString(),
-            lastSeenAt: new Date().toISOString()
+            activatedAt: nowIso,
+            lastSeenAt: nowIso
           });
           lic.boundDevices = bound;
           if (Array.isArray(lic.unboundDeviceIds)) {
@@ -2714,7 +2847,7 @@ export async function activateLicenseOnDevice(token: string): Promise<{
           return {
             success: true,
             license: lic,
-            message: '🎉 PRO License အောင်မြင်စွာ ဖွင့်ပြီးပါပြီ! (Online Real-Time Synced)'
+            message: `🎉 PRO License အောင်မြင်စွာ ဖွင့်ပြီးပါပြီ! (${formatLicensePlanLabel(lic.duration, 'my')})`
           };
         }
       }
@@ -2733,12 +2866,13 @@ export async function activateLicenseOnDevice(token: string): Promise<{
     if (contentType.includes('application/json')) {
       const json = await res.json();
       if (json.success && json.license) {
-        saveStoredActiveLicense(json.license);
+        const normalizedLic = normalizeLicenseRecord(json.license);
+        saveStoredActiveLicense(normalizedLic);
         // Ensure Supabase global_licenses is also up-to-date
         const current = await fetchLicensesFromCloud();
-        const merged = [json.license, ...current.filter(l => l.token !== json.license.token)];
+        const merged = [normalizedLic, ...current.filter(l => l.token.toUpperCase() !== normalizedLic.token.toUpperCase())];
         saveLicensesToCloud(merged).catch(() => {});
-        return { success: true, license: json.license };
+        return { success: true, license: normalizedLic };
       } else if (json.error === 'revoked' || json.error === 'expired' || json.error === 'device_limit_exceeded') {
         return {
           success: false,
@@ -2756,17 +2890,11 @@ export async function activateLicenseOnDevice(token: string): Promise<{
   if (match) {
     const durCode = match[1].toUpperCase();
     const devCode = match[2].toUpperCase();
-
-    let days = 30;
-    let durationStr: LicenseToken['duration'] = '1_month';
-    if (durCode === '1W') { days = 7; durationStr = '1_week'; }
-    else if (durCode === '1M') { days = 30; durationStr = '1_month'; }
-    else if (durCode === '3M') { days = 90; durationStr = '3_months'; }
-    else if (durCode === '6M') { days = 180; durationStr = '6_months'; }
-    else if (durCode === '1Y') { days = 365; durationStr = '1_year'; }
-    else if (durCode === 'LIFE') { days = 3650; durationStr = 'lifetime'; }
-
+    const durationStr: LicenseToken['duration'] = CODE_TO_DURATION[durCode] || '1_month';
+    const spec = LICENSE_PLAN_SPECS[durationStr];
+    const days = spec.days;
     const devLimit: 1 | 2 = devCode === '2D' ? 2 : 1;
+    const nowIso = new Date().toISOString();
 
     const offlineLicense: LicenseToken = {
       id: `lic_offline_${Date.now()}`,
@@ -2778,10 +2906,10 @@ export async function activateLicenseOnDevice(token: string): Promise<{
       boundDevices: [{
         deviceId,
         deviceModel,
-        activatedAt: new Date().toISOString(),
-        lastSeenAt: new Date().toISOString()
+        activatedAt: nowIso,
+        lastSeenAt: nowIso
       }],
-      createdAt: new Date().toISOString(),
+      createdAt: nowIso,
       expiresAt: new Date(Date.now() + days * 86400000).toISOString(),
       status: 'active',
       note: 'Direct Activation (Auto-Synced to Cloud)'
@@ -2804,7 +2932,7 @@ export async function activateLicenseOnDevice(token: string): Promise<{
     return {
       success: true,
       license: offlineLicense,
-      message: '🎉 PRO License အောင်မြင်စွာ ဖွင့်ပြီးပါပြီ! (VPN မလိုဘဲ အသုံးပြုနိုင်ပါပြီ)'
+      message: `🎉 PRO License အောင်မြင်စွာ ဖွင့်ပြီးပါပြီ! (${spec.labelMy})`
     };
   }
 
@@ -2812,7 +2940,7 @@ export async function activateLicenseOnDevice(token: string): Promise<{
   try {
     const cachedRaw = localStorage.getItem(STORAGE_ALL_LICENSES_KEY);
     if (cachedRaw) {
-      const cachedList: LicenseToken[] = JSON.parse(cachedRaw);
+      const cachedList: LicenseToken[] = JSON.parse(cachedRaw).map((item: LicenseToken) => normalizeLicenseRecord(item));
       const found = cachedList.find(l => l.token.toUpperCase() === cleaned || l.id === cleaned);
       if (found && found.status === 'active' && new Date(found.expiresAt).getTime() > Date.now()) {
         saveStoredActiveLicense(found);
@@ -2824,7 +2952,7 @@ export async function activateLicenseOnDevice(token: string): Promise<{
   return {
     success: false,
     error: 'invalid_token',
-    message: 'လိုင်စင်ကုဒ် မှားယွင်းနေပါသည်။ (ဥပမာ ပုံစံ: SOLAR-PRO-1M-1D-XXXX-YYYY)'
+    message: 'လိုင်စင်ကုဒ် မှားယွင်းနေပါသည်။ (ဥပမာ ပုံစံ: SOLAR-PRO-1W-1D-XXXX-YYYY သို့မဟုတ် SOLAR-PRO-1M-1D-XXXX-YYYY)'
   };
 }
 
@@ -2870,6 +2998,7 @@ export async function extendLicenseDuration(licenseId: string, days: number = 30
     const base = currentExp > Date.now() ? currentExp : Date.now();
     lic.expiresAt = new Date(base + days * 86400000).toISOString();
     lic.status = 'active';
+    lic.manuallyExtended = true;
     await saveLicensesToCloud(licenses);
     return { success: true, license: lic };
   }

@@ -158,7 +158,10 @@ export const ViberTelegramPurchaseBanner: React.FC<ViberTelegramPurchaseBannerPr
                 {isLicenseActive ? (
                   <span className="flex items-center gap-1 text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30">
                     <ShieldCheck className="w-3.5 h-3.5" />
-                    <span>PRO ACTIVE: {remainingDays}d {remainingHours}h ({activeLicense?.boundDevices?.length || 1}/{activeLicense?.deviceLimit || 1} Device)</span>
+                    <span>
+                      {activeLicense?.duration?.toUpperCase().replace('_', ' ')} PRO:{' '}
+                      {activeLicense?.duration === 'lifetime' ? '∞' : `${remainingDays}d ${remainingHours}h`} ({activeLicense?.boundDevices?.length || 1}/{activeLicense?.deviceLimit || 1} Device)
+                    </span>
                   </span>
                 ) : isLicenseExpired ? (
                   <span className="flex items-center gap-1 text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-rose-500/15 text-rose-500 dark:text-rose-400 border border-rose-500/30 animate-pulse">

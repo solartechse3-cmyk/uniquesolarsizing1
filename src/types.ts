@@ -98,6 +98,7 @@ export interface LicenseToken {
   note?: string;
   unboundDeviceIds?: string[];
   unboundAllAt?: string;
+  manuallyExtended?: boolean;
 }
 
 export interface DurationPackage {

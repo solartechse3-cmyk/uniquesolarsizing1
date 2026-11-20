@@ -126,7 +126,12 @@ import {
   deleteLicenseFromCloud,
   publishLiveSystemUpdate,
   getStoredActiveLicense,
-  saveStoredActiveLicense
+  saveStoredActiveLicense,
+  normalizeLicenseRecord,
+  formatLicensePlanLabel,
+  formatLicenseRemainingLabel,
+  isLicenseManuallyDeactivated,
+  setLicenseManuallyDeactivated
 } from './lib/supabase';
 import { parseSolarPanelsFile, parseInvertersFile } from './lib/spreadsheetParser';
 import { 
@@ -927,6 +932,7 @@ export default function App() {
   const [showLicenseModal, setShowLicenseModal] = useState<boolean>(false);
   const justActivatedAtRef = useRef<number>(0);
   const autoRebindingTokenRef = useRef<string>('');
+  const urlActivationInFlightRef = useRef<boolean>(false);
 
   const [isPaywallLocked, setIsPaywallLocked] = useState<boolean>(() => {
     try {
@@ -1099,33 +1105,50 @@ export default function App() {
     let isMounted = true;
 
     // Reconcile the current device's active PRO license against the live cloud license list
-    const reconcileActiveLicenseWithCloud = (licenses: LicenseToken[], notifyChanges: boolean) => {
-      if (!Array.isArray(licenses) || licenses.length === 0) return;
+    const reconcileActiveLicenseWithCloud = (rawLicenses: LicenseToken[], notifyChanges: boolean) => {
+      if (!Array.isArray(rawLicenses) || rawLicenses.length === 0) return;
+      // Never override an in-flight ?license=... URL activation
+      if (urlActivationInFlightRef.current) return;
+
+      const licenses = rawLicenses.map(normalizeLicenseRecord);
       const stored = getStoredActiveLicense();
       const myDeviceId = getMyDeviceId();
       const recentlyActivated = Date.now() - justActivatedAtRef.current < 8000;
 
-      // Auto-restore active PRO license if this device is already bound in Supabase Cloud
+      // Auto-restore active PRO license ONLY if the user did NOT manually click Deactivate
       if (!stored || !stored.token) {
-        const boundActive = licenses.find(l => {
-          if (l.status !== 'active' || new Date(l.expiresAt).getTime() <= Date.now()) return false;
-          const myBound = Array.isArray(l.boundDevices) ? l.boundDevices.find(b => b.deviceId === myDeviceId) : undefined;
-          if (!myBound) return false;
-          const explicitlyUnbound = Array.isArray(l.unboundDeviceIds) && l.unboundDeviceIds.includes(myDeviceId);
-          const unboundAllLater = Boolean(l.unboundAllAt && myBound.activatedAt && new Date(l.unboundAllAt).getTime() > new Date(myBound.activatedAt).getTime());
-          return !explicitlyUnbound && !unboundAllLater;
-        });
-        if (boundActive) {
-          setActiveLicense(boundActive);
-          saveStoredActiveLicense(boundActive);
+        if (isLicenseManuallyDeactivated()) return;
+        const boundCandidates = licenses
+          .map(l => {
+            if (l.status !== 'active' || new Date(l.expiresAt).getTime() <= Date.now()) return null;
+            const myBound = Array.isArray(l.boundDevices) ? l.boundDevices.find(b => b.deviceId === myDeviceId) : undefined;
+            if (!myBound) return null;
+            const explicitlyUnbound = Array.isArray(l.unboundDeviceIds) && l.unboundDeviceIds.includes(myDeviceId);
+            const unboundAllLater = Boolean(l.unboundAllAt && myBound.activatedAt && new Date(l.unboundAllAt).getTime() > new Date(myBound.activatedAt).getTime());
+            if (explicitlyUnbound || unboundAllLater) return null;
+            const ts = Math.max(
+              new Date(myBound.lastSeenAt || 0).getTime(),
+              new Date(myBound.activatedAt || 0).getTime(),
+              new Date(l.createdAt || 0).getTime()
+            );
+            return { lic: l, ts };
+          })
+          .filter((x): x is { lic: LicenseToken; ts: number } => Boolean(x))
+          .sort((a, b) => b.ts - a.ts);
+
+        if (boundCandidates.length > 0) {
+          const latestBound = boundCandidates[0].lic;
+          setActiveLicense(latestBound);
+          saveStoredActiveLicense(latestBound);
           setIsPaywallLocked(false);
         }
         return;
       }
 
-      const matched = licenses.find(
+      const matchedRaw = licenses.find(
         l => l.token.toUpperCase() === stored.token.toUpperCase() || l.id === stored.id
       );
+      const matched = matchedRaw ? normalizeLicenseRecord(matchedRaw) : undefined;
 
       if (matched) {
         const isExpired = matched.status === 'expired' || new Date(matched.expiresAt).getTime() <= Date.now();
@@ -1357,36 +1380,34 @@ export default function App() {
       }
     }).catch(() => {});
 
-    // Fetch Licenses from Supabase Cloud & reconcile active license immediately
-    fetchLicensesFromCloud().then(licRes => {
-      if (isMounted && Array.isArray(licRes)) {
-        setAllLicenses(licRes);
-        reconcileActiveLicenseWithCloud(licRes, true);
-      }
-    }).catch(() => {});
-
-    // Auto-detect ?license=... link in URL for 1-click activation from Viber/Telegram link
+    // Auto-detect ?license=... link in URL FIRST (before cloud reconcile so an older bound key NEVER overwrites the clicked link!)
+    let hasUrlLicense = false;
     try {
       const searchParams = new URLSearchParams(window.location.search);
       const urlLicense = searchParams.get('license');
       if (urlLicense && urlLicense.trim()) {
+        hasUrlLicense = true;
+        urlActivationInFlightRef.current = true;
         const cleanToken = urlLicense.trim();
         justActivatedAtRef.current = Date.now();
+        setLicenseManuallyDeactivated(false);
         activateLicenseOnDevice(cleanToken).then(res => {
+          urlActivationInFlightRef.current = false;
           if (res.success && res.license) {
+            const normalizedLic = normalizeLicenseRecord(res.license);
             justActivatedAtRef.current = Date.now();
-            setActiveLicense(res.license);
-            saveStoredActiveLicense(res.license);
-            setAllLicenses(prev => [res.license!, ...prev.filter(l => l.token.toUpperCase() !== res.license!.token.toUpperCase())]);
+            setActiveLicense(normalizedLic);
+            saveStoredActiveLicense(normalizedLic);
+            setAllLicenses(prev => [normalizedLic, ...prev.filter(l => l.token.toUpperCase() !== normalizedLic.token.toUpperCase())]);
             setIsPaywallLocked(false);
             setShowLicenseModal(false);
             try {
-              appendLicenseRecordToSheet(res.license, window.location.origin).catch(() => {});
+              appendLicenseRecordToSheet(normalizedLic, window.location.origin).catch(() => {});
             } catch (e) {}
             setStatusMsg({
               text: lang === 'my' 
-                ? `🎉 PRO Package အောင်မြင်စွာ ဖွင့်ပြီးပါပြီ! (${res.license.customerName || 'User'})` 
-                : `🎉 PRO Package activated successfully!`,
+                ? `🎉 PRO Package အောင်မြင်စွာ ဖွင့်ပြီးပါပြီ! (${formatLicensePlanLabel(normalizedLic.duration, 'my')} • ${normalizedLic.customerName || 'User'})` 
+                : `🎉 PRO Package activated! (${formatLicensePlanLabel(normalizedLic.duration, 'en')})`,
               type: 'success'
             });
             setTimeout(() => setStatusMsg(null), 5000);
@@ -1397,12 +1418,32 @@ export default function App() {
             });
             setTimeout(() => setStatusMsg(null), 6000);
           }
+          // Refresh cloud licenses list after URL activation completes
+          fetchLicensesFromCloud().then(licRes => {
+            if (isMounted && Array.isArray(licRes)) {
+              setAllLicenses(licRes);
+            }
+          }).catch(() => {});
+        }).catch(() => {
+          urlActivationInFlightRef.current = false;
         });
         const cleanUrl = new URL(window.location.href);
         cleanUrl.searchParams.delete('license');
         window.history.replaceState({}, '', cleanUrl.pathname + cleanUrl.search);
       }
-    } catch (e) {}
+    } catch (e) {
+      urlActivationInFlightRef.current = false;
+    }
+
+    // Fetch Licenses from Supabase Cloud & reconcile active license immediately (skipped during URL activation)
+    if (!hasUrlLicense) {
+      fetchLicensesFromCloud().then(licRes => {
+        if (isMounted && Array.isArray(licRes)) {
+          setAllLicenses(licRes);
+          reconcileActiveLicenseWithCloud(licRes, true);
+        }
+      }).catch(() => {});
+    }
 
     // Realtime subscription for live mounting database broadcasts
     const unsubMounting = subscribeToMountingDatabaseUpdates((newDb) => {
@@ -2032,20 +2073,22 @@ export default function App() {
   // License Activation & Management Handlers
   const handleActivateLicense = async (token: string): Promise<{ success: boolean; message?: string }> => {
     justActivatedAtRef.current = Date.now();
+    setLicenseManuallyDeactivated(false);
     const res = await activateLicenseOnDevice(token);
     if (res.success && res.license) {
+      const normalizedLic = normalizeLicenseRecord(res.license);
       justActivatedAtRef.current = Date.now();
-      setActiveLicense(res.license);
-      saveStoredActiveLicense(res.license);
-      setAllLicenses(prev => [res.license!, ...prev.filter(l => l.token.toUpperCase() !== res.license!.token.toUpperCase())]);
+      setActiveLicense(normalizedLic);
+      saveStoredActiveLicense(normalizedLic);
+      setAllLicenses(prev => [normalizedLic, ...prev.filter(l => l.token.toUpperCase() !== normalizedLic.token.toUpperCase())]);
       setIsPaywallLocked(false);
       try {
-        appendLicenseRecordToSheet(res.license, window.location.origin).catch(() => {});
+        appendLicenseRecordToSheet(normalizedLic, window.location.origin).catch(() => {});
       } catch (e) {}
       setStatusMsg({
         text: lang === 'my' 
-          ? `🎉 PRO Package အောင်မြင်စွာ ဖွင့်ပြီးပါပြီ! (${res.license.duration})` 
-          : `🎉 PRO Package activated successfully!`,
+          ? `🎉 PRO Package အောင်မြင်စွာ ဖွင့်ပြီးပါပြီ! (${formatLicensePlanLabel(normalizedLic.duration, 'my')})` 
+          : `🎉 PRO Package activated successfully! (${formatLicensePlanLabel(normalizedLic.duration, 'en')})`,
         type: 'success'
       });
       setTimeout(() => setStatusMsg(null), 5000);
@@ -2055,14 +2098,15 @@ export default function App() {
   };
 
   const handleDeactivateLicense = () => {
+    setLicenseManuallyDeactivated(true);
     setActiveLicense(null);
     saveStoredActiveLicense(null);
     setIsPaywallLocked(true);
     setStatusMsg({
-      text: lang === 'my' ? 'လိုင်စင် အသုံးပြုခွင့်ကို ပိတ်သိမ်းလိုက်ပါပြီ' : 'License deactivated',
+      text: lang === 'my' ? 'လိုင်စင် အသုံးပြုခွင့်ကို ဖြုတ်လိုက်ပါပြီ — လိုင်စင်အသစ် ထည့်သွင်းနိုင်ပါသည်' : 'License deactivated — you can enter a new key',
       type: 'info'
     });
-    setTimeout(() => setStatusMsg(null), 3000);
+    setTimeout(() => setStatusMsg(null), 3500);
   };
 
   const handleGenerateLicense = async (params: { 
@@ -2915,7 +2959,7 @@ Trina Vertex S+ 430W,51.4,43.2,430,9.96,10.59`;
                     {activeLicense.duration.toUpperCase().replace('_', ' ')} PRO
                   </span>
                   <span className="text-[9px] sm:text-[10px] bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 px-1.5 py-0.5 rounded font-mono font-bold">
-                    {Math.max(0, Math.ceil((new Date(activeLicense.expiresAt).getTime() - Date.now()) / (1000 * 60 * 60 * 24)))}d left
+                    {formatLicenseRemainingLabel(activeLicense.expiresAt, activeLicense.duration, lang)}
                   </span>
                 </button>
               ) : activeLicense && new Date(activeLicense.expiresAt).getTime() <= Date.now() ? (

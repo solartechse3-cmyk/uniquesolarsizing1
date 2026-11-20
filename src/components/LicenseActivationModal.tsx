@@ -22,6 +22,7 @@ import {
 } from 'lucide-react';
 import { motion } from 'motion/react';
 import { AdminContactConfig, LicenseToken, SupportedLanguage } from '../types';
+import { extractLicenseTokenFromInput, formatLicensePlanLabel, formatLicenseRemainingLabel } from '../lib/supabase';
 
 interface LicenseActivationModalProps {
   isOpen: boolean;
@@ -68,15 +69,7 @@ export const LicenseActivationModal: React.FC<LicenseActivationModalProps> = ({
       if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.readText) {
         const text = await navigator.clipboard.readText();
         if (text) {
-          // If copied whole link e.g. https://...?license=PRO-..., extract token
-          if (text.includes('license=')) {
-            const match = text.match(/license=([A-Za-z0-9_-]+)/);
-            if (match && match[1]) {
-              setTokenInput(match[1]);
-              return;
-            }
-          }
-          setTokenInput(text.trim());
+          setTokenInput(extractLicenseTokenFromInput(text));
         }
       }
     } catch (e) {}
@@ -84,13 +77,8 @@ export const LicenseActivationModal: React.FC<LicenseActivationModalProps> = ({
 
   const handleActivateSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    let token = tokenInput.trim();
+    const token = extractLicenseTokenFromInput(tokenInput);
     if (!token) return;
-
-    if (token.includes('license=')) {
-      const match = token.match(/license=([A-Za-z0-9_-]+)/);
-      if (match && match[1]) token = match[1];
-    }
 
     setIsActivating(true);
     setFeedback(null);
@@ -198,7 +186,7 @@ export const LicenseActivationModal: React.FC<LicenseActivationModalProps> = ({
                     </div>
                   </div>
                   <span className="px-3 py-1 rounded-full bg-emerald-500/20 text-emerald-300 text-xs font-mono font-bold">
-                    {activeLicense.duration?.toUpperCase().replace('_', ' ')}
+                    {formatLicensePlanLabel(activeLicense.duration, lang)}
                   </span>
                 </div>
 
@@ -216,7 +204,9 @@ export const LicenseActivationModal: React.FC<LicenseActivationModalProps> = ({
                   <div>
                     <span className="text-slate-400 block text-[11px]">Expires At:</span>
                     <span className="font-bold text-white font-mono">
-                      {new Date(activeLicense.expiresAt).toLocaleDateString()} ({remainingDays} Days Remaining)
+                      {activeLicense.duration === 'lifetime'
+                        ? (lang === 'my' ? 'တစ်သက်တာ (Lifetime)' : 'Lifetime')
+                        : `${new Date(activeLicense.expiresAt).toLocaleDateString()} (${formatLicenseRemainingLabel(activeLicense.expiresAt, activeLicense.duration, lang)})`}
                     </span>
                   </div>
                   <div>
@@ -269,9 +259,41 @@ export const LicenseActivationModal: React.FC<LicenseActivationModalProps> = ({
                 </div>
               )}
 
+              {/* Switch / Enter a Different License Key */}
+              <form onSubmit={handleActivateSubmit} className="p-3.5 rounded-2xl bg-slate-100 dark:bg-slate-950/80 border border-slate-200 dark:border-slate-800 space-y-2.5">
+                <span className="text-[11px] font-bold text-slate-500 dark:text-slate-400 block">
+                  {lang === 'my' ? '🔑 အခြား License Key အသစ် ပြောင်းလဲထည့်သွင်းရန် (Switch Key):' : '🔑 Switch to a Different License Key:'}
+                </span>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={tokenInput}
+                    onChange={(e) => setTokenInput(e.target.value)}
+                    placeholder="SOLAR-PRO-1W-1D-XXXX-YYYY"
+                    className="flex-1 min-w-0 px-3 py-2 rounded-xl bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 text-xs font-mono font-bold text-slate-900 dark:text-white focus:border-amber-500 focus:outline-none"
+                  />
+                  <button
+                    type="submit"
+                    disabled={isActivating || !tokenInput.trim()}
+                    className="px-3.5 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-extrabold text-xs cursor-pointer shrink-0 transition-all"
+                  >
+                    {isActivating ? '...' : (lang === 'my' ? 'ပြောင်းမည်' : 'Switch')}
+                  </button>
+                </div>
+                {feedback && (
+                  <div className={`text-xs font-semibold px-3 py-2 rounded-xl ${
+                    feedback.type === 'success'
+                      ? 'bg-emerald-500/15 text-emerald-500 border border-emerald-500/30'
+                      : 'bg-rose-500/15 text-rose-400 border border-rose-500/30'
+                  }`}>
+                    {feedback.message}
+                  </div>
+                )}
+              </form>
+
               {/* Deactivate / Switch Device button */}
               {onDeactivateLicense && (
-                <div className="pt-2 text-center">
+                <div className="pt-1 text-center">
                   <button
                     type="button"
                     onClick={onDeactivateLicense}
