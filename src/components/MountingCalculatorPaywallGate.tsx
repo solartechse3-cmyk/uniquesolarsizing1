@@ -22,6 +22,7 @@ import {
   RefreshCw
 } from 'lucide-react';
 import { AdminContactConfig, LicenseToken, SupportedLanguage } from '../types';
+import { extractLicenseTokenFromInput } from '../lib/supabase';
 
 interface MountingCalculatorPaywallGateProps {
   activeTab: 'string_sizer' | 'mounting_calc' | 'dc_breaker_calc';
@@ -84,7 +85,7 @@ export const MountingCalculatorPaywallGate: React.FC<MountingCalculatorPaywallGa
 
   const handleInlineActivate = async (e: React.FormEvent) => {
     e.preventDefault();
-    const token = inputToken.trim();
+    const token = extractLicenseTokenFromInput(inputToken);
     if (!token || !onActivateToken) return;
 
     setIsActivating(true);

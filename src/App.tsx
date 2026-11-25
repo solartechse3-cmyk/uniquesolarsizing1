@@ -79,7 +79,8 @@ import { MountingDatabaseModal } from './components/MountingDatabaseModal';
 import {
   getInitialMountingDatabase,
   fetchMountingDatabaseFromCloud,
-  subscribeToMountingDatabaseUpdates
+  subscribeToMountingDatabaseUpdates,
+  STORAGE_MOUNTING_DB_KEY
 } from './lib/mountingDatabaseSync';
 import { 
   INITIAL_ADMIN_RESOURCES, 
@@ -87,6 +88,8 @@ import {
   getSupabaseCredentials, 
   initSupabase, 
   isSupabaseConnected,
+  resetSupabaseClient,
+  RealtimeSyncStatus,
   getClientDevice,
   getMyDeviceId,
   getMySessionId,
@@ -120,6 +123,7 @@ import {
   saveLicensesToCloud,
   generateLicenseOnServer,
   activateLicenseOnDevice,
+  deactivateLicenseOnDevice,
   unbindLicenseDevice,
   extendLicenseDuration,
   updateLicenseStatus,
@@ -736,18 +740,22 @@ export default function App() {
     return DEFAULT_BATTERY_PRESETS;
   });
 
-  const handleUpdateCustomBatteries = async (batteries: BatteryPreset[]) => {
+  const handleUpdateCustomBatteries = async (batteries: BatteryPreset[]): Promise<{ success: boolean; error?: string; count?: number }> => {
     setCustomBatteries(batteries);
     try {
       localStorage.setItem('solar_sizer_custom_batteries_v1', JSON.stringify(batteries));
     } catch (e) {}
-    await saveCustomBatteriesToCloud(batteries);
-    publishLiveSystemUpdate('Batteries database updated', {
-      inverters: customInverters,
-      panels: customPanels,
-      batteries,
-      mountingDatabase
-    }).catch(() => {});
+    const res = await saveCustomBatteriesToCloud(batteries);
+    if (!res.success) {
+      setStatusMsg({
+        text: lang === 'my'
+          ? `⚠️ Battery Database ကို Supabase Cloud သို့ တင်ရာတွင် မအောင်မြင်ပါ (${res.error || 'Network error'})`
+          : `⚠️ Failed to sync Batteries to Supabase Cloud: ${res.error || 'Network error'}`,
+        type: 'error'
+      });
+      setTimeout(() => setStatusMsg(null), 5000);
+    }
+    return { success: res.success, error: res.error, count: batteries.length };
   };
 
   // Active Selection states
@@ -1099,6 +1107,7 @@ export default function App() {
       isConnected: Boolean(creds.url && creds.anonKey)
     };
   });
+  const [realtimeStatus, setRealtimeStatus] = useState<RealtimeSyncStatus>('connecting');
 
   // Initial server & cloud fetch for Payment Config, Inverters, Panels, Batteries, Resources, Mounting DB, Licenses & Realtime Sync
   useEffect(() => {
@@ -1572,6 +1581,9 @@ export default function App() {
             return prev;
           });
         }
+      },
+      onRealtimeStatusChange: (status) => {
+        if (isMounted) setRealtimeStatus(status);
       }
     });
 
@@ -1580,24 +1592,44 @@ export default function App() {
       unsubscribe();
       unsubMounting();
     };
-  }, []);
+  }, [supabaseConfig.url, supabaseConfig.anonKey]);
 
   // Sync Payment Config to Cloud whenever updated
-  const handleUpdatePaymentConfig = async (newConfig: PaymentConfig) => {
+  const handleUpdatePaymentConfig = async (newConfig: PaymentConfig): Promise<{ success: boolean; error?: string }> => {
     setPaymentConfig(newConfig);
     try {
       localStorage.setItem('solar_sizer_payment_config_v2', JSON.stringify(newConfig));
     } catch (e) {}
-    await savePaymentConfigToCloud(newConfig);
+    const res = await savePaymentConfigToCloud(newConfig);
+    if (!res.success) {
+      setStatusMsg({
+        text: lang === 'my'
+          ? `⚠️ Payment Config ကို Supabase သို့ သိမ်းဆည်းမရပါ (${res.error || 'Network error'})`
+          : `⚠️ Failed to save Payment Config to Supabase: ${res.error || 'Network error'}`,
+        type: 'error'
+      });
+      setTimeout(() => setStatusMsg(null), 5000);
+    }
+    return res;
   };
 
   // Sync App Branding to Cloud & All Connected Users whenever updated by Admin
-  const handleUpdateAppBranding = async (newBranding: AppBranding) => {
+  const handleUpdateAppBranding = async (newBranding: AppBranding): Promise<{ success: boolean; error?: string }> => {
     setAppBranding(newBranding);
     try {
       localStorage.setItem('solar_sizer_app_branding_v1', JSON.stringify(newBranding));
     } catch (e) {}
-    await saveAppBrandingToCloud(newBranding);
+    const res = await saveAppBrandingToCloud(newBranding);
+    if (!res.success) {
+      setStatusMsg({
+        text: lang === 'my'
+          ? `⚠️ App Branding ကို Supabase သို့ သိမ်းဆည်းမရပါ (${res.error || 'Network error'})`
+          : `⚠️ Failed to sync App Branding to Supabase: ${res.error || 'Network error'}`,
+        type: 'error'
+      });
+      setTimeout(() => setStatusMsg(null), 5000);
+    }
+    return res;
   };
 
   // Realtime Live Presences state - ONLY genuine real active sessions (NO sample/mock data)
@@ -1703,7 +1735,7 @@ export default function App() {
   }, [isPaywallLocked]);
 
   // Admin Resource Handlers
-  const handleAddResource = async (resource: Omit<AdminResourceFile, 'id' | 'uploadedAt' | 'downloadsCount'>) => {
+  const handleAddResource = async (resource: Omit<AdminResourceFile, 'id' | 'uploadedAt' | 'downloadsCount'>): Promise<{ success: boolean; error?: string }> => {
     const newRes: AdminResourceFile = {
       ...resource,
       id: `res_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
@@ -1717,16 +1749,14 @@ export default function App() {
       localStorage.setItem('solar_sizer_admin_resources_v3', JSON.stringify(sanitizeResourcesForLocalCache(updated)));
     } catch (e) {}
     const syncRes = await saveAdminResourcesToCloud(updated);
-    publishLiveSystemUpdate(`New resource uploaded: ${newRes.title}`, {
-      adminResources: updated
-    }).catch(() => {});
     setStatusMsg({
       text: lang === 'my' 
         ? (syncRes.success ? "အင်ဂျင်နီယာဖိုင်အသစ် အောင်မြင်စွာ တင်ပြီး Online အသုံးပြုသူအားလုံးစီသို့ Real-time ဖြန့်ဝေပြီးပါပြီ!" : `⚠️ ဖိုင် Cloud တင်ရာတွင် အခက်အခဲရှိပါသည် (${syncRes.error || 'size limit'})`)
         : (syncRes.success ? "Resource file successfully published & synced live to all online users!" : `⚠️ Cloud upload issue: ${syncRes.error || 'Error'}`),
       type: syncRes.success ? 'success' : 'error'
     });
-    setTimeout(() => setStatusMsg(null), 4500);
+    setTimeout(() => setStatusMsg(null), 5000);
+    return syncRes;
   };
 
   const handleDeleteResource = async (id: string) => {
@@ -1736,12 +1766,14 @@ export default function App() {
       localStorage.setItem('solar_sizer_admin_resources_v3', JSON.stringify(sanitizeResourcesForLocalCache(updated)));
     } catch (e) {}
     await deleteResourceFileFromCloud(id);
-    await saveAdminResourcesToCloud(updated);
+    const syncRes = await saveAdminResourcesToCloud(updated);
     setStatusMsg({
-      text: lang === 'my' ? "ဖိုင်ကို ဖျက်သိမ်းပြီး Cloud တွင် အဆင့်မြှင့်တင်လိုက်ပါပြီ" : "Resource removed and synced across cloud.",
-      type: 'success'
+      text: syncRes.success
+        ? (lang === 'my' ? "ဖိုင်ကို ဖျက်သိမ်းပြီး Cloud တွင် အဆင့်မြှင့်တင်လိုက်ပါပြီ" : "Resource removed and synced across cloud.")
+        : (lang === 'my' ? `⚠️ Cloud မှ ဖျက်သိမ်းရာတွင် မအောင်မြင်ပါ (${syncRes.error || 'Error'})` : `⚠️ Cloud delete failed: ${syncRes.error || 'Error'}`),
+      type: syncRes.success ? 'success' : 'error'
     });
-    setTimeout(() => setStatusMsg(null), 3000);
+    setTimeout(() => setStatusMsg(null), 4000);
   };
 
   // Spec Request Handlers
@@ -1799,23 +1831,36 @@ export default function App() {
   };
 
   const handleUpdateSupabaseConfig = (cfg: SupabaseConfig) => {
-    setSupabaseConfig(cfg);
     try {
-      localStorage.setItem('solar_sizer_supabase_config', JSON.stringify({
-        url: cfg.url,
-        anonKey: cfg.anonKey
-      }));
+      if (cfg.url && cfg.anonKey) {
+        localStorage.setItem('solar_sizer_supabase_config', JSON.stringify({
+          url: cfg.url.trim(),
+          anonKey: cfg.anonKey.trim()
+        }));
+      } else {
+        localStorage.removeItem('solar_sizer_supabase_config');
+      }
     } catch (e) {}
 
-    // Persist to Express backend and .env
+    // Reset cached Supabase singleton so Realtime WebSocket & REST client immediately reconnect with new credentials
+    resetSupabaseClient();
+    setRealtimeStatus('connecting');
+    const activeCreds = getSupabaseCredentials();
+    setSupabaseConfig({
+      url: activeCreds.url,
+      anonKey: activeCreds.anonKey,
+      isConnected: Boolean(activeCreds.url && activeCreds.anonKey)
+    });
+
+    // Persist to Express backend and .env when running locally
     fetch('/api/supabase-config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: cfg.url, anonKey: cfg.anonKey })
+      body: JSON.stringify({ url: activeCreds.url, anonKey: activeCreds.anonKey })
     }).catch(() => {});
 
     setStatusMsg({
-      text: cfg.isConnected ? "Supabase Cloud Database ချိတ်ဆက်ပြီးပါပြီ!" : "Supabase ဆက်တင် သိမ်းဆည်းပြီးပါပြီ",
+      text: activeCreds.url ? "Supabase Cloud Database ပြန်လည်ချိတ်ဆက်ပြီး Real-time Sync စတင်နေပါပြီ!" : "Supabase ဆက်တင် သိမ်းဆည်းပြီးပါပြီ",
       type: 'success'
     });
     setTimeout(() => setStatusMsg(null), 4000);
@@ -2097,16 +2142,25 @@ export default function App() {
     return { success: false, message: res.message || res.error || 'Activation failed' };
   };
 
-  const handleDeactivateLicense = () => {
-    setLicenseManuallyDeactivated(true);
+  const handleDeactivateLicense = async () => {
+    const res = await deactivateLicenseOnDevice(activeLicense);
     setActiveLicense(null);
     saveStoredActiveLicense(null);
     setIsPaywallLocked(true);
+    fetchLicensesFromCloud().then(updated => {
+      if (Array.isArray(updated)) setAllLicenses(updated);
+    }).catch(() => {});
     setStatusMsg({
-      text: lang === 'my' ? 'လိုင်စင် အသုံးပြုခွင့်ကို ဖြုတ်လိုက်ပါပြီ — လိုင်စင်အသစ် ထည့်သွင်းနိုင်ပါသည်' : 'License deactivated — you can enter a new key',
-      type: 'info'
+      text: res.success
+        ? (lang === 'my'
+            ? '✅ ဤစက်မှ လိုင်စင်ဖြုတ်ပြီး Cloud Device Slot ကို ပြန်ဖွင့်ပေးပြီးပါပြီ — အခြားစက် သို့မဟုတ် Key အသစ် ပြောင်းလဲသုံးနိုင်ပါသည်'
+            : '✅ License deactivated & device slot released in cloud — you can now activate on another device or enter a new key')
+        : (lang === 'my'
+            ? `လိုင်စင်ကို ဤစက်မှ ဖြုတ်လိုက်ပါပြီ (${res.error || 'Cloud sync pending'})`
+            : `License deactivated locally (${res.error || 'Cloud sync pending'})`),
+      type: res.success ? 'info' : 'error'
     });
-    setTimeout(() => setStatusMsg(null), 3500);
+    setTimeout(() => setStatusMsg(null), 4500);
   };
 
   const handleGenerateLicense = async (params: { 
@@ -2123,35 +2177,107 @@ export default function App() {
   };
 
   const handleUnbindLicenseDevice = async (licenseId: string, deviceId?: string) => {
-    await unbindLicenseDevice(licenseId, deviceId);
+    const res = await unbindLicenseDevice(licenseId, deviceId);
+    if (!res.success) {
+      setStatusMsg({
+        text: lang === 'my'
+          ? `⚠️ စက်ဖြုတ်ရာတွင် Supabase Cloud နှင့် ချိတ်ဆက်မရပါ (${res.error || 'Network error'})`
+          : `⚠️ Failed to unbind device in Supabase: ${res.error || 'Network error'}`,
+        type: 'error'
+      });
+      setTimeout(() => setStatusMsg(null), 5000);
+      return;
+    }
     const updated = await fetchLicensesFromCloud();
     setAllLicenses(updated);
+    setStatusMsg({
+      text: lang === 'my' ? '✅ စက်ချိတ်ဆက်မှုကို Cloud မှ ဖြုတ်လိုက်ပြီး Real-time Update ပို့ပြီးပါပြီ' : '✅ Device unbound in cloud & synced live',
+      type: 'success'
+    });
+    setTimeout(() => setStatusMsg(null), 3500);
   };
 
   const handleExtendLicense = async (licenseId: string, days: number) => {
-    await extendLicenseDuration(licenseId, days);
+    const res = await extendLicenseDuration(licenseId, days);
+    if (!res.success) {
+      setStatusMsg({
+        text: lang === 'my'
+          ? `⚠️ သက်တမ်းတိုးရာတွင် Supabase Cloud နှင့် ချိတ်ဆက်မရပါ (${res.error || 'Network error'})`
+          : `⚠️ Failed to extend license in Supabase: ${res.error || 'Network error'}`,
+        type: 'error'
+      });
+      setTimeout(() => setStatusMsg(null), 5000);
+      return;
+    }
     const updated = await fetchLicensesFromCloud();
     setAllLicenses(updated);
+    setStatusMsg({
+      text: lang === 'my' ? `✅ လိုင်စင်သက်တမ်း +${days} ရက် တိုးပြီး Cloud တွင် Update ဖြစ်သွားပါပြီ` : `✅ License extended by +${days} days & synced live`,
+      type: 'success'
+    });
+    setTimeout(() => setStatusMsg(null), 3500);
   };
 
   const handleUpdateLicenseStatus = async (licenseId: string, status: LicenseToken['status']) => {
-    await updateLicenseStatus(licenseId, status);
+    const res = await updateLicenseStatus(licenseId, status);
+    if (!res.success) {
+      setStatusMsg({
+        text: lang === 'my'
+          ? `⚠️ လိုင်စင်အခြေအနေ ပြောင်းရာတွင် မအောင်မြင်ပါ (${res.error || 'Network error'})`
+          : `⚠️ Failed to update license status in Supabase: ${res.error || 'Network error'}`,
+        type: 'error'
+      });
+      setTimeout(() => setStatusMsg(null), 5000);
+      return;
+    }
     const updated = await fetchLicensesFromCloud();
     setAllLicenses(updated);
+    setStatusMsg({
+      text: status === 'revoked'
+        ? (lang === 'my' ? '⛔ လိုင်စင်ကို ပိတ်သိမ်းပြီး Real-time Sync ပို့လိုက်ပါပြီ' : '⛔ License revoked & synced live')
+        : (lang === 'my' ? '✅ လိုင်စင်ကို ပြန်ဖွင့်ပြီး Real-time Sync ပို့လိုက်ပါပြီ' : '✅ License reactivated & synced live'),
+      type: status === 'revoked' ? 'info' : 'success'
+    });
+    setTimeout(() => setStatusMsg(null), 3500);
   };
 
   const handleDeleteLicense = async (licenseId: string) => {
-    await deleteLicenseFromCloud(licenseId);
+    const res = await deleteLicenseFromCloud(licenseId);
+    if (!res.success) {
+      setStatusMsg({
+        text: lang === 'my'
+          ? `⚠️ လိုင်စင်ဖျက်ရာတွင် မအောင်မြင်ပါ (${res.error || 'Network error'})`
+          : `⚠️ Failed to delete license from Supabase: ${res.error || 'Network error'}`,
+        type: 'error'
+      });
+      setTimeout(() => setStatusMsg(null), 5000);
+      return;
+    }
     setAllLicenses(prev => prev.filter(l => l.id !== licenseId));
+    setStatusMsg({
+      text: lang === 'my' ? '🗑️ လိုင်စင်ကို Cloud မှ အပြီးတိုင် ဖျက်သိမ်းလိုက်ပါပြီ' : '🗑️ License permanently deleted from cloud',
+      type: 'info'
+    });
+    setTimeout(() => setStatusMsg(null), 3500);
   };
 
-  const handleUpdateAdminContact = async (newContact: AdminContactConfig) => {
+  const handleUpdateAdminContact = async (newContact: AdminContactConfig): Promise<{ success: boolean; error?: string }> => {
     setAdminContact(newContact);
     try {
       localStorage.setItem('solar_sizer_admin_contact_v1', JSON.stringify(newContact));
       localStorage.setItem('solar_admin_contact_config_v1', JSON.stringify(newContact));
     } catch (e) {}
-    await saveAdminContactToCloud(newContact);
+    const res = await saveAdminContactToCloud(newContact);
+    if (!res.success) {
+      setStatusMsg({
+        text: lang === 'my'
+          ? `⚠️ Viber/Telegram အချက်အလက် Supabase သို့ သိမ်းဆည်းမရပါ (${res.error || 'Network error'})`
+          : `⚠️ Failed to sync contact info to Supabase: ${res.error || 'Network error'}`,
+        type: 'error'
+      });
+      setTimeout(() => setStatusMsg(null), 5000);
+    }
+    return res;
   };
 
   const handlePublishLiveUpdate = async (note?: string) => {
@@ -2171,6 +2297,85 @@ export default function App() {
   const handleRefreshLicenses = async () => {
     const updated = await fetchLicensesFromCloud();
     setAllLicenses(updated);
+  };
+
+  const handlePullLatestFromCloud = async (): Promise<{
+    success: boolean;
+    inverters: number;
+    panels: number;
+    batteries: number;
+    licenses: number;
+    resources: number;
+    error?: string;
+  }> => {
+    try {
+      const [invRes, pnlRes, batRes, resRes, mountRes, licRes, contactRes, brandRes] = await Promise.all([
+        fetchCustomInvertersFromCloud(),
+        fetchCustomPanelsFromCloud(),
+        fetchCustomBatteriesFromCloud(),
+        fetchAdminResourcesFromCloud(),
+        fetchMountingDatabaseFromCloud(),
+        fetchLicensesFromCloud(),
+        fetchAdminContactFromCloud(),
+        fetchAppBrandingFromCloud()
+      ]);
+
+      let invCount = customInverters.length;
+      let pnlCount = customPanels.length;
+      let batCount = customBatteries.length;
+      let licCount = allLicenses.length;
+      let resCount = adminResources.length;
+
+      if (invRes && Array.isArray(invRes.inverters) && invRes.inverters.length > 0) {
+        setCustomInverters(invRes.inverters);
+        invCount = invRes.inverters.length;
+      }
+      if (pnlRes && Array.isArray(pnlRes.panels) && pnlRes.panels.length > 0) {
+        const sanitized = ensureUniquePanelIds(pnlRes.panels);
+        setCustomPanels(sanitized);
+        pnlCount = sanitized.length;
+      }
+      if (batRes && Array.isArray(batRes.batteries) && batRes.batteries.length > 0) {
+        setCustomBatteries(batRes.batteries);
+        batCount = batRes.batteries.length;
+      }
+      if (resRes && Array.isArray(resRes.resources)) {
+        setAdminResources(resRes.resources);
+        resCount = resRes.resources.length;
+      }
+      if (mountRes && mountRes.db && Array.isArray(mountRes.db.panels) && mountRes.db.panels.length > 0) {
+        setMountingDatabase(mountRes.db);
+      }
+      if (Array.isArray(licRes)) {
+        setAllLicenses(licRes);
+        licCount = licRes.length;
+      }
+      if (contactRes) {
+        setAdminContact(contactRes);
+      }
+      if (brandRes && brandRes.branding) {
+        setAppBranding(brandRes.branding);
+      }
+
+      return {
+        success: true,
+        inverters: invCount,
+        panels: pnlCount,
+        batteries: batCount,
+        licenses: licCount,
+        resources: resCount
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        inverters: customInverters.length,
+        panels: customPanels.length,
+        batteries: customBatteries.length,
+        licenses: allLicenses.length,
+        resources: adminResources.length,
+        error: err?.message || 'Cloud pull failed'
+      };
+    }
   };
 
   // Collapsible state for step-by-step formula block
@@ -2533,15 +2738,17 @@ export default function App() {
       try {
         localStorage.setItem('solar_sizer_custom_inverters_v3', JSON.stringify(importedList));
       } catch (e) {}
-      await saveCustomInvertersToCloud(importedList);
+      const cloudRes = await saveCustomInvertersToCloud(importedList);
 
       if (importedList.length > 0) {
         setSelectedInverterId(importedList[0].id); // Auto-select the first imported inverter
       }
 
       setStatusMsg({ 
-        text: lang === 'my' ? `အရင် data များကို ရှင်းလင်းပြီး အင်ဗာတာအသစ် ${importedList.length} ခု (Excel / CSV မှ) Cloud နှင့် စက်ထဲ အောင်မြင်စွာ တင်သွင်းပြီးပါပြီ!` : `Replaced existing database with ${importedList.length} new inverters (Synced to Cloud)!`, 
-        type: 'success' 
+        text: cloudRes.success
+          ? (lang === 'my' ? `အရင် data များကို ရှင်းလင်းပြီး အင်ဗာတာအသစ် ${importedList.length} ခု Supabase Cloud နှင့် စက်ထဲ အောင်မြင်စွာ Real-time တင်သွင်းပြီးပါပြီ!` : `Replaced database with ${importedList.length} new inverters & synced live to Supabase!`)
+          : (lang === 'my' ? `⚠️ စက်ထဲတွင် Inverter ${importedList.length} ခု ထည့်ပြီးသော်လည်း Supabase Cloud တင်ရာတွင် မအောင်မြင်ပါ (${cloudRes.error || 'Network error'})` : `⚠️ Saved locally, but Supabase Cloud sync failed: ${cloudRes.error || 'Network error'}`), 
+        type: cloudRes.success ? 'success' : 'error' 
       });
       setTimeout(() => setStatusMsg(null), 5000);
     } catch (err: any) {
@@ -2569,15 +2776,17 @@ export default function App() {
       try {
         localStorage.setItem('solar_sizer_custom_panels_v3', JSON.stringify(importedList));
       } catch (e) {}
-      await saveCustomPanelsToCloud(importedList);
+      const cloudRes = await saveCustomPanelsToCloud(importedList);
 
       if (importedList.length > 0) {
         setSelectedPanelId(importedList[0].id); // Auto-select the first imported panel
       }
 
       setStatusMsg({ 
-        text: lang === 'my' ? `အရင် data များကို ရှင်းလင်းပြီး ဆိုလာပြားအသစ် ${importedList.length} ခု (Excel / CSV မှ Watt အချက်အလက်များအပါအဝင်) Cloud နှင့် စက်ထဲ အောင်မြင်စွာ တင်သွင်းပြီးပါပြီ!` : `Replaced existing database with ${importedList.length} new panels with verified Watts (Synced to Cloud)!`, 
-        type: 'success' 
+        text: cloudRes.success
+          ? (lang === 'my' ? `အရင် data များကို ရှင်းလင်းပြီး ဆိုလာပြားအသစ် ${importedList.length} ခု Supabase Cloud နှင့် စက်ထဲ အောင်မြင်စွာ Real-time တင်သွင်းပြီးပါပြီ!` : `Replaced database with ${importedList.length} new panels & synced live to Supabase!`)
+          : (lang === 'my' ? `⚠️ စက်ထဲတွင် Panel ${importedList.length} ခု ထည့်ပြီးသော်လည်း Supabase Cloud တင်ရာတွင် မအောင်မြင်ပါ (${cloudRes.error || 'Network error'})` : `⚠️ Saved locally, but Supabase Cloud sync failed: ${cloudRes.error || 'Network error'}`), 
+        type: cloudRes.success ? 'success' : 'error' 
       });
       setTimeout(() => setStatusMsg(null), 5000);
     } catch (err: any) {
@@ -2643,11 +2852,16 @@ export default function App() {
     try {
       localStorage.setItem('solar_sizer_custom_inverters_v3', JSON.stringify(newList));
     } catch (e) {}
-    await saveCustomInvertersToCloud(newList);
+    const cloudRes = await saveCustomInvertersToCloud(newList);
     setSelectedInverterId(targetId);
     setEditingInverterId(null);
-    setStatusMsg({ text: t.manualInverterSuccess, type: 'success' });
-    setTimeout(() => setStatusMsg(null), 4000);
+    setStatusMsg({
+      text: cloudRes.success
+        ? t.manualInverterSuccess
+        : (lang === 'my' ? `⚠️ စက်ထဲသိမ်းပြီးသော်လည်း Cloud Sync မအောင်မြင်ပါ (${cloudRes.error || 'Error'})` : `⚠️ Saved locally, Cloud sync failed: ${cloudRes.error || 'Error'}`),
+      type: cloudRes.success ? 'success' : 'error'
+    });
+    setTimeout(() => setStatusMsg(null), 4500);
   };
 
   // Save manual custom panel form to Persistent Templates
@@ -2692,11 +2906,16 @@ export default function App() {
     try {
       localStorage.setItem('solar_sizer_custom_panels_v3', JSON.stringify(newList));
     } catch (e) {}
-    await saveCustomPanelsToCloud(newList);
+    const cloudRes = await saveCustomPanelsToCloud(newList);
     setSelectedPanelId(targetId);
     setEditingPanelId(null);
-    setStatusMsg({ text: t.manualPanelSuccess, type: 'success' });
-    setTimeout(() => setStatusMsg(null), 4000);
+    setStatusMsg({
+      text: cloudRes.success
+        ? t.manualPanelSuccess
+        : (lang === 'my' ? `⚠️ စက်ထဲသိမ်းပြီးသော်လည်း Cloud Sync မအောင်မြင်ပါ (${cloudRes.error || 'Error'})` : `⚠️ Saved locally, Cloud sync failed: ${cloudRes.error || 'Error'}`),
+      type: cloudRes.success ? 'success' : 'error'
+    });
+    setTimeout(() => setStatusMsg(null), 4500);
   };
 
   // Delete custom inverter template
@@ -2710,7 +2929,11 @@ export default function App() {
         try {
           localStorage.setItem('solar_sizer_custom_inverters_v3', JSON.stringify(newList));
         } catch (err) {}
-        await saveCustomInvertersToCloud(newList);
+        const cloudRes = await saveCustomInvertersToCloud(newList);
+        if (!cloudRes.success) {
+          setStatusMsg({ text: `⚠️ Cloud sync error: ${cloudRes.error || 'Failed'}`, type: 'error' });
+          setTimeout(() => setStatusMsg(null), 4000);
+        }
         if (selectedInverterId === id) {
           if (newList.length > 0) {
             setSelectedInverterId(newList[0].id);
@@ -2733,7 +2956,11 @@ export default function App() {
         try {
           localStorage.setItem('solar_sizer_custom_panels_v3', JSON.stringify(newList));
         } catch (err) {}
-        await saveCustomPanelsToCloud(newList);
+        const cloudRes = await saveCustomPanelsToCloud(newList);
+        if (!cloudRes.success) {
+          setStatusMsg({ text: `⚠️ Cloud sync error: ${cloudRes.error || 'Failed'}`, type: 'error' });
+          setTimeout(() => setStatusMsg(null), 4000);
+        }
         if (selectedPanelId === id) {
           if (newList.length > 0) {
             setSelectedPanelId(newList[0].id);
@@ -2745,36 +2972,25 @@ export default function App() {
     } catch (err) {}
   };
 
-  // Dedicated handlers for AdminPanelModal callbacks that also update cloud
-  const handleUpdateCustomInverters = async (inverters: Inverter[]) => {
-    setCustomInverters(inverters);
+  // Dedicated handlers for AdminPanelModal callbacks that write directly to Supabase & broadcast live
+  const handleUpdateCustomInverters = async (inverters: Inverter[]): Promise<{ success: boolean; error?: string; count?: number }> => {
+    const sanitized = ensureUniqueInverterIds(inverters);
+    setCustomInverters(sanitized);
     try {
-      localStorage.setItem('solar_sizer_custom_inverters_v3', JSON.stringify(inverters));
+      localStorage.setItem('solar_sizer_custom_inverters_v3', JSON.stringify(sanitized));
     } catch (e) {}
-    await saveCustomInvertersToCloud(inverters);
-    // Instantly publish to Supabase Cloud and notify all active GitHub Pages users
-    publishLiveSystemUpdate('Inverters updated via CSV batch upload', {
-      inverters,
-      panels: customPanels,
-      batteries: customBatteries,
-      mountingDatabase
-    }).catch(() => {});
+    const res = await saveCustomInvertersToCloud(sanitized);
+    return { success: res.success, error: res.error, count: sanitized.length };
   };
 
-  const handleUpdateCustomPanels = async (panels: PanelPreset[]) => {
+  const handleUpdateCustomPanels = async (panels: PanelPreset[]): Promise<{ success: boolean; error?: string; count?: number }> => {
     const sanitized = ensureUniquePanelIds(panels);
     setCustomPanels(sanitized);
     try {
       localStorage.setItem('solar_sizer_custom_panels_v3', JSON.stringify(sanitized));
     } catch (e) {}
-    await saveCustomPanelsToCloud(sanitized);
-    // Instantly publish to Supabase Cloud and notify all active GitHub Pages users
-    publishLiveSystemUpdate('Solar Panels updated via CSV batch upload', {
-      inverters: customInverters,
-      panels: sanitized,
-      batteries: customBatteries,
-      mountingDatabase
-    }).catch(() => {});
+    const res = await saveCustomPanelsToCloud(sanitized);
+    return { success: res.success, error: res.error, count: sanitized.length };
   };
 
   // Export/Download current list of inverters to CSV file
@@ -4646,7 +4862,9 @@ Trina Vertex S+ 430W,51.4,43.2,430,9.96,10.59`;
         onDeleteSpecRequest={handleDeleteSpecRequest}
         activePresences={activePresences}
         supabaseConfig={supabaseConfig}
+        realtimeStatus={realtimeStatus}
         onUpdateSupabaseConfig={handleUpdateSupabaseConfig}
+        onPullLatestFromCloud={handlePullLatestFromCloud}
         customInverters={customInverters}
         onUpdateCustomInverters={handleUpdateCustomInverters}
         customPanels={customPanels}
@@ -4674,6 +4892,9 @@ Trina Vertex S+ 430W,51.4,43.2,430,9.96,10.59`;
         database={mountingDatabase}
         onUpdateDatabase={(updatedDb) => {
           setMountingDatabase(updatedDb);
+          try {
+            localStorage.setItem(STORAGE_MOUNTING_DB_KEY, JSON.stringify(updatedDb));
+          } catch (e) {}
         }}
         onShowToast={(msg) => {
           setStatusMsg(msg);

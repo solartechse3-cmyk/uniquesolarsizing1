@@ -1403,10 +1403,14 @@ function generateLicenseRecord(customerName, duration, deviceLimit = 1, note) {
   });
   return newLicense;
 }
-app.post("/api/license/generate", (req, res) => {
+app.post("/api/license/generate", async (req, res) => {
   try {
     const { customerName, duration, deviceLimit, note } = req.body;
+    await pullAndMergeLicensesFromSupabase().catch(() => {
+    });
     const newLicense = generateLicenseRecord(customerName, duration, deviceLimit, note);
+    await syncLicensesToSupabase(memoryStorage["licenses"]).catch(() => {
+    });
     return res.json({ success: true, license: newLicense });
   } catch (err) {
     return res.status(500).json({ success: false, error: err?.message || "Failed to generate license" });
@@ -2515,7 +2519,18 @@ VITE_SUPABASE_ANON_KEY=${cfg.anonKey}`;
   res.json({ success: true, config: cfg });
 });
 app.post("/api/publish-update", async (req, res) => {
-  const { note, inverters, panels, batteries, mountingDatabase, adminContact, adminResources, appBranding, licenses, paymentConfig } = req.body;
+  const {
+    note,
+    inverters,
+    panels,
+    batteries,
+    mountingDatabase,
+    adminContact,
+    adminResources,
+    appBranding,
+    paymentConfig,
+    skipSupabaseMirror
+  } = req.body;
   if (inverters && Array.isArray(inverters)) {
     memoryStorage["inverters"] = inverters;
     try {
@@ -2573,62 +2588,64 @@ app.post("/api/publish-update", async (req, res) => {
     note: note || "Admin published live update"
   };
   broadcastSSE("system_published", publishPayload);
-  const cloudRows = [
-    { id: "global_system_published", value: { publishedAt, note: publishPayload.note, timestamp: Date.now() }, updated_at: publishedAt }
-  ];
-  if (Array.isArray(memoryStorage["inverters"])) {
-    cloudRows.push(
-      { id: "global_custom_inverters", value: memoryStorage["inverters"], updated_at: publishedAt },
-      { id: "inverters", value: memoryStorage["inverters"], updated_at: publishedAt }
-    );
-  }
-  if (Array.isArray(memoryStorage["panels"])) {
-    cloudRows.push(
-      { id: "global_custom_panels", value: memoryStorage["panels"], updated_at: publishedAt },
-      { id: "panels", value: memoryStorage["panels"], updated_at: publishedAt }
-    );
-  }
-  if (Array.isArray(memoryStorage["batteries"])) {
-    cloudRows.push({ id: "global_custom_batteries", value: memoryStorage["batteries"], updated_at: publishedAt });
-  }
-  if (memoryStorage["mounting_database"]) {
-    cloudRows.push({ id: "global_mounting_database", value: memoryStorage["mounting_database"], updated_at: publishedAt });
-  }
-  if (memoryStorage["admin_contact"]) {
-    cloudRows.push(
-      { id: "global_admin_contact", value: memoryStorage["admin_contact"], updated_at: publishedAt },
-      { id: "admin_contact_config", value: memoryStorage["admin_contact"], updated_at: publishedAt }
-    );
-  }
-  if (memoryStorage["app_branding"]) {
-    cloudRows.push({ id: "global_app_branding", value: memoryStorage["app_branding"], updated_at: publishedAt });
-  }
-  if (memoryStorage["payment_config"]) {
-    cloudRows.push({ id: "global_payment_config", value: memoryStorage["payment_config"], updated_at: publishedAt });
-  }
-  if (Array.isArray(memoryStorage["resources"])) {
-    const lightResources = memoryStorage["resources"].map((r) => {
-      if (r.fileData && String(r.fileData).startsWith("data:")) {
-        upsertSupabaseAppSettings([{
-          id: `resource_file_${r.id}`,
-          value: { id: r.id, fileName: r.fileName, fileType: r.fileType, fileData: r.fileData },
-          updated_at: publishedAt
-        }]).catch(() => {
-        });
-        const { fileData: _ignored, ...meta } = r;
-        return { ...meta, hasCloudFile: true };
-      }
-      return r;
+  if (!skipSupabaseMirror) {
+    const cloudRows = [
+      { id: "global_system_published", value: { publishedAt, note: publishPayload.note, timestamp: Date.now() }, updated_at: publishedAt }
+    ];
+    if (Array.isArray(inverters)) {
+      cloudRows.push(
+        { id: "global_custom_inverters", value: inverters, updated_at: publishedAt },
+        { id: "inverters", value: inverters, updated_at: publishedAt }
+      );
+    }
+    if (Array.isArray(panels)) {
+      cloudRows.push(
+        { id: "global_custom_panels", value: panels, updated_at: publishedAt },
+        { id: "panels", value: panels, updated_at: publishedAt }
+      );
+    }
+    if (Array.isArray(batteries)) {
+      cloudRows.push({ id: "global_custom_batteries", value: batteries, updated_at: publishedAt });
+    }
+    if (mountingDatabase) {
+      cloudRows.push({ id: "global_mounting_database", value: mountingDatabase, updated_at: publishedAt });
+    }
+    if (adminContact) {
+      cloudRows.push(
+        { id: "global_admin_contact", value: adminContact, updated_at: publishedAt },
+        { id: "admin_contact_config", value: adminContact, updated_at: publishedAt }
+      );
+    }
+    if (appBranding) {
+      cloudRows.push({ id: "global_app_branding", value: appBranding, updated_at: publishedAt });
+    }
+    if (paymentConfig) {
+      cloudRows.push({ id: "global_payment_config", value: paymentConfig, updated_at: publishedAt });
+    }
+    if (Array.isArray(adminResources)) {
+      const lightResources = adminResources.map((r) => {
+        if (r.fileData && String(r.fileData).startsWith("data:")) {
+          upsertSupabaseAppSettings([{
+            id: `resource_file_${r.id}`,
+            value: { id: r.id, fileName: r.fileName, fileType: r.fileType, fileData: r.fileData },
+            updated_at: publishedAt
+          }]).catch(() => {
+          });
+          const { fileData: _ignored, ...meta } = r;
+          return { ...meta, hasCloudFile: true };
+        }
+        return r;
+      });
+      cloudRows.push({ id: "global_admin_resources", value: lightResources, updated_at: publishedAt });
+    }
+    await upsertSupabaseAppSettings(cloudRows);
+    broadcastSupabaseEvent("system_published", {
+      publishedAt,
+      note: publishPayload.note,
+      timestamp: Date.now()
+    }).catch(() => {
     });
-    cloudRows.push({ id: "global_admin_resources", value: lightResources, updated_at: publishedAt });
   }
-  await upsertSupabaseAppSettings(cloudRows);
-  broadcastSupabaseEvent("system_published", {
-    publishedAt,
-    note: publishPayload.note,
-    timestamp: Date.now()
-  }).catch(() => {
-  });
   res.json({ success: true, publishedAt: publishPayload.publishedAt });
 });
 app.get("/api/data/:key", (req, res) => {

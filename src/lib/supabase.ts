@@ -91,6 +91,7 @@ export const INITIAL_SPEC_REQUESTS: SpecRequest[] = [
 ];
 
 let supabaseClient: SupabaseClient | null = null;
+let supabaseClientCreds: { url: string; anonKey: string } | null = null;
 
 // Verified Supabase Cloud Production Credentials for 100% Real-Time Multi-Device Sync on GitHub Pages
 export const DEFAULT_SUPABASE_URL = 'https://vkiwylrerryidoiyqeqh.supabase.co';
@@ -131,21 +132,25 @@ export function getSupabaseCredentials(): { url: string; anonKey: string } {
   let url = '';
   let anonKey = '';
 
+  // 1. Admin localStorage override takes priority when explicitly configured
   try {
-    const metaEnv = (import.meta as any)?.env;
-    if (metaEnv) {
-      url = metaEnv.VITE_SUPABASE_URL || '';
-      anonKey = metaEnv.VITE_SUPABASE_ANON_KEY || '';
+    const stored = localStorage.getItem('solar_sizer_supabase_config');
+    if (stored) {
+      const parsed = JSON.parse(stored);
+      if (parsed.url) url = parsed.url;
+      if (isValidSupabaseAnonKey(parsed.anonKey)) anonKey = parsed.anonKey;
     }
   } catch (e) {}
 
+  // 2. Vite environment variables fallback
   if (!url || !isValidSupabaseAnonKey(anonKey)) {
     try {
-      const stored = localStorage.getItem('solar_sizer_supabase_config');
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (parsed.url && !url) url = parsed.url;
-        if (isValidSupabaseAnonKey(parsed.anonKey)) anonKey = parsed.anonKey;
+      const metaEnv = (import.meta as any)?.env;
+      if (metaEnv) {
+        if (!url && metaEnv.VITE_SUPABASE_URL) url = metaEnv.VITE_SUPABASE_URL;
+        if (!isValidSupabaseAnonKey(anonKey) && isValidSupabaseAnonKey(metaEnv.VITE_SUPABASE_ANON_KEY)) {
+          anonKey = metaEnv.VITE_SUPABASE_ANON_KEY;
+        }
       }
     } catch (e) {}
   }
@@ -164,6 +169,26 @@ export function getSupabaseCredentials(): { url: string; anonKey: string } {
   };
 }
 
+let sharedGlobalRealtimeChannel: any = null;
+let sharedGlobalRealtimeSubscribed = false;
+
+/**
+ * Tears down cached Supabase client and active realtime channels so updated credentials
+ * take effect immediately without requiring a full page refresh.
+ */
+export function resetSupabaseClient(): void {
+  if (sharedGlobalRealtimeChannel) {
+    try { sharedGlobalRealtimeChannel.unsubscribe(); } catch (e) {}
+    sharedGlobalRealtimeChannel = null;
+    sharedGlobalRealtimeSubscribed = false;
+  }
+  if (supabaseClient) {
+    try { supabaseClient.removeAllChannels(); } catch (e) {}
+    supabaseClient = null;
+    supabaseClientCreds = null;
+  }
+}
+
 export function initSupabase(): SupabaseClient | null {
   const { url, anonKey } = getSupabaseCredentials();
 
@@ -171,8 +196,18 @@ export function initSupabase(): SupabaseClient | null {
     return null;
   }
 
-  if (supabaseClient) {
+  // If credentials changed since client was created, rebuild automatically
+  if (
+    supabaseClient &&
+    supabaseClientCreds &&
+    supabaseClientCreds.url === url &&
+    supabaseClientCreds.anonKey === anonKey
+  ) {
     return supabaseClient;
+  }
+
+  if (supabaseClient) {
+    resetSupabaseClient();
   }
 
   try {
@@ -187,6 +222,7 @@ export function initSupabase(): SupabaseClient | null {
         }
       }
     });
+    supabaseClientCreds = { url, anonKey };
     return supabaseClient;
   } catch (err) {
     console.warn('Supabase initialization failed:', err);
@@ -194,46 +230,189 @@ export function initSupabase(): SupabaseClient | null {
   }
 }
 
-let sharedGlobalRealtimeChannel: any = null;
-let sharedGlobalRealtimeSubscribed = false;
+export interface SupabaseDiagnosticResult {
+  success: boolean;
+  latencyMs: number;
+  restOk: boolean;
+  broadcastOk: boolean;
+  url: string;
+  counts?: {
+    inverters: number;
+    panels: number;
+    batteries: number;
+    licenses: number;
+    resources: number;
+    mountingPanels: number;
+  };
+  lastPublishedAt?: string;
+  error?: string;
+}
+
+/**
+ * Live diagnostic check against Supabase REST (`app_settings`) AND Realtime Broadcast API.
+ */
+export async function testSupabaseConnection(
+  customUrl?: string,
+  customAnonKey?: string
+): Promise<SupabaseDiagnosticResult> {
+  const startedAt = Date.now();
+  const fallback = getSupabaseCredentials();
+  const url = normalizeSupabaseUrl(customUrl || fallback.url);
+  const anonKey = (customAnonKey && isValidSupabaseAnonKey(customAnonKey))
+    ? customAnonKey.trim()
+    : fallback.anonKey;
+
+  if (!url || !anonKey) {
+    return {
+      success: false,
+      latencyMs: Date.now() - startedAt,
+      restOk: false,
+      broadcastOk: false,
+      url: url || '',
+      error: 'Missing or invalid Supabase URL / Anon Key'
+    };
+  }
+
+  try {
+    const testClient = createClient(url, anonKey, {
+      global: {
+        fetch: (input: RequestInfo | URL, init?: RequestInit) =>
+          fetch(input, { ...init, cache: 'no-store' })
+      }
+    });
+
+    const { data: rows, error } = await testClient
+      .from('app_settings')
+      .select('id, value, updated_at')
+      .in('id', [
+        'global_custom_inverters',
+        'global_custom_panels',
+        'global_custom_batteries',
+        'global_licenses',
+        'global_admin_resources',
+        'global_mounting_database',
+        'global_system_published'
+      ]);
+
+    if (error) {
+      return {
+        success: false,
+        latencyMs: Date.now() - startedAt,
+        restOk: false,
+        broadcastOk: false,
+        url,
+        error: error.message
+      };
+    }
+
+    const rowMap: Record<string, any> = {};
+    for (const r of (rows || []) as any[]) {
+      rowMap[r.id] = r;
+    }
+
+    // Verify Realtime HTTP Broadcast endpoint
+    let broadcastOk = false;
+    try {
+      const bRes = await fetch(`${url}/realtime/v1/api/broadcast`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          apikey: anonKey,
+          Authorization: `Bearer ${anonKey}`
+        },
+        body: JSON.stringify({
+          messages: [
+            {
+              topic: 'solar_global_database_events',
+              event: 'ping',
+              payload: { timestamp: Date.now() }
+            }
+          ]
+        })
+      });
+      broadcastOk = bRes.ok || bRes.status === 202;
+    } catch (e) {}
+
+    return {
+      success: true,
+      latencyMs: Date.now() - startedAt,
+      restOk: true,
+      broadcastOk,
+      url,
+      counts: {
+        inverters: Array.isArray(rowMap['global_custom_inverters']?.value) ? rowMap['global_custom_inverters'].value.length : 0,
+        panels: Array.isArray(rowMap['global_custom_panels']?.value) ? rowMap['global_custom_panels'].value.length : 0,
+        batteries: Array.isArray(rowMap['global_custom_batteries']?.value) ? rowMap['global_custom_batteries'].value.length : 0,
+        licenses: Array.isArray(rowMap['global_licenses']?.value) ? rowMap['global_licenses'].value.length : 0,
+        resources: Array.isArray(rowMap['global_admin_resources']?.value) ? rowMap['global_admin_resources'].value.length : 0,
+        mountingPanels: Array.isArray(rowMap['global_mounting_database']?.value?.panels) ? rowMap['global_mounting_database'].value.panels.length : 0
+      },
+      lastPublishedAt: rowMap['global_system_published']?.value?.publishedAt || rowMap['global_system_published']?.updated_at
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      latencyMs: Date.now() - startedAt,
+      restOk: false,
+      broadcastOk: false,
+      url,
+      error: err?.message || 'Connection failed'
+    };
+  }
+}
 
 /**
  * Safely broadcast a real-time event to all connected clients without unsubscribing
- * any active listener channel. Uses active WebSocket channel if subscribed AND
- * Supabase Realtime HTTP Broadcast API so every GitHub Pages client receives it instantaneously.
+ * any active listener channel. Uses Supabase Realtime HTTP Broadcast API (guaranteed delivery
+ * to every connected WebSocket client including GitHub Pages) with WebSocket fallback and eventId deduplication.
  */
-export async function broadcastCloudEvent(event: string, payload: Record<string, any>): Promise<void> {
+export async function broadcastCloudEvent(event: string, payload: Record<string, any>): Promise<boolean> {
+  const enrichedPayload = {
+    ...payload,
+    eventId: `${event}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+    senderSessionId: getMySessionId()
+  };
+
+  let deliveredViaHttp = false;
   try {
-    if (sharedGlobalRealtimeChannel && sharedGlobalRealtimeSubscribed) {
-      sharedGlobalRealtimeChannel.send({
-        type: 'broadcast',
-        event,
-        payload
+    const { url, anonKey } = getSupabaseCredentials();
+    if (url && anonKey) {
+      const res = await fetch(`${url}/realtime/v1/api/broadcast`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          apikey: anonKey,
+          Authorization: `Bearer ${anonKey}`
+        },
+        body: JSON.stringify({
+          messages: [
+            {
+              topic: 'solar_global_database_events',
+              event,
+              payload: enrichedPayload
+            }
+          ]
+        })
       });
+      deliveredViaHttp = res.ok || res.status === 202;
     }
   } catch (e) {}
 
-  try {
-    const { url, anonKey } = getSupabaseCredentials();
-    if (!url || !anonKey) return;
-    await fetch(`${url}/realtime/v1/api/broadcast`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        apikey: anonKey,
-        Authorization: `Bearer ${anonKey}`
-      },
-      body: JSON.stringify({
-        messages: [
-          {
-            topic: 'solar_global_database_events',
-            event,
-            payload
-          }
-        ]
-      })
-    });
-  } catch (e) {}
+  // Fallback to active WebSocket channel if HTTP broadcast failed
+  if (!deliveredViaHttp) {
+    try {
+      if (sharedGlobalRealtimeChannel && sharedGlobalRealtimeSubscribed) {
+        await sharedGlobalRealtimeChannel.send({
+          type: 'broadcast',
+          event,
+          payload: enrichedPayload
+        });
+        return true;
+      }
+    } catch (e) {}
+  }
+
+  return deliveredViaHttp;
 }
 
 export function isSupabaseConnected(): boolean {
@@ -703,7 +882,7 @@ export async function savePaymentRecordsToCloud(
   // 4. Upsert to Supabase Cloud
   const client = initSupabase();
   if (!client) {
-    return { success: true, source: 'cloud', count: records.length };
+    return { success: false, source: 'local', count: records.length, error: 'Supabase client not configured' };
   }
 
   try {
@@ -716,14 +895,14 @@ export async function savePaymentRecordsToCloud(
       }, { onConflict: 'id' });
 
     if (error) {
-      return { success: true, source: 'cloud', count: records.length, error: error.message };
+      return { success: false, source: 'local', count: records.length, error: error.message };
     }
 
-    broadcastCloudEvent('payment_records_changed', { records, timestamp: Date.now() }).catch(() => {});
+    await broadcastCloudEvent('payment_records_changed', { count: records.length, timestamp: Date.now() }).catch(() => {});
 
     return { success: true, source: 'cloud', count: records.length };
   } catch (err: any) {
-    return { success: true, source: 'cloud', count: records.length, error: err?.message };
+    return { success: false, source: 'local', count: records.length, error: err?.message };
   }
 }
 
@@ -796,7 +975,7 @@ export async function savePaymentConfigToCloud(config: any): Promise<{ success: 
 
   const client = initSupabase();
   if (!client) {
-    return { success: true, source: 'cloud' };
+    return { success: false, source: 'local', error: 'Supabase client not configured' };
   }
 
   try {
@@ -809,14 +988,14 @@ export async function savePaymentConfigToCloud(config: any): Promise<{ success: 
       }, { onConflict: 'id' });
 
     if (error) {
-      return { success: true, source: 'cloud', error: error.message };
+      return { success: false, source: 'local', error: error.message };
     }
 
-    broadcastCloudEvent('payment_config_changed', { config, timestamp: Date.now() }).catch(() => {});
+    await broadcastCloudEvent('payment_config_changed', { config, timestamp: Date.now() }).catch(() => {});
 
     return { success: true, source: 'cloud' };
   } catch (err: any) {
-    return { success: true, source: 'cloud', error: err?.message };
+    return { success: false, source: 'local', error: err?.message };
   }
 }
 
@@ -905,10 +1084,11 @@ export async function saveCustomInvertersToCloud(
   // 4. Persist to Supabase tables for all connected GitHub & web users
   const client = initSupabase();
   if (!client) {
-    return { success: true, source: 'cloud', count: inverters.length };
+    return { success: false, source: 'local', count: inverters.length, error: 'Supabase client not configured' };
   }
 
   try {
+    const nowIso = new Date().toISOString();
     // Save to app_settings (both global_custom_inverters and inverters keys)
     const { error } = await client
       .from('app_settings')
@@ -916,23 +1096,24 @@ export async function saveCustomInvertersToCloud(
         {
           id: 'global_custom_inverters',
           value: inverters,
-          updated_at: new Date().toISOString()
+          updated_at: nowIso
         },
         {
           id: 'inverters',
           value: inverters,
-          updated_at: new Date().toISOString()
+          updated_at: nowIso
         }
       ], { onConflict: 'id' });
 
     if (error) {
       console.warn('Supabase inverters upsert notice:', error.message);
+      return { success: false, source: 'local', count: inverters.length, error: error.message };
     }
 
     // Broadcast lightweight live signal via Supabase Realtime so all connected GitHub clients pull fresh data instantly
-    broadcastCloudEvent('inverters_changed', { count: inverters.length, timestamp: Date.now() }).catch(() => {});
+    await broadcastCloudEvent('inverters_changed', { count: inverters.length, updatedAt: nowIso, timestamp: Date.now() }).catch(() => {});
 
-    return { success: !error, source: 'cloud', count: inverters.length, error: error?.message };
+    return { success: true, source: 'cloud', count: inverters.length };
   } catch (err: any) {
     return { success: false, source: 'local', count: inverters.length, error: err?.message };
   }
@@ -1047,10 +1228,11 @@ export async function saveCustomPanelsToCloud(
   // 4. Persist to Supabase tables for all users
   const client = initSupabase();
   if (!client) {
-    return { success: true, source: 'cloud', count: panels.length };
+    return { success: false, source: 'local', count: panels.length, error: 'Supabase client not configured' };
   }
 
   try {
+    const nowIso = new Date().toISOString();
     // Save to app_settings (both global_custom_panels and panels keys)
     const { error } = await client
       .from('app_settings')
@@ -1058,23 +1240,24 @@ export async function saveCustomPanelsToCloud(
         {
           id: 'global_custom_panels',
           value: panels,
-          updated_at: new Date().toISOString()
+          updated_at: nowIso
         },
         {
           id: 'panels',
           value: panels,
-          updated_at: new Date().toISOString()
+          updated_at: nowIso
         }
       ], { onConflict: 'id' });
 
     if (error) {
       console.warn('Supabase panels upsert notice:', error.message);
+      return { success: false, source: 'local', count: panels.length, error: error.message };
     }
 
     // Broadcast lightweight live signal via Supabase Realtime so all connected GitHub clients pull fresh data instantly
-    broadcastCloudEvent('panels_changed', { count: panels.length, timestamp: Date.now() }).catch(() => {});
+    await broadcastCloudEvent('panels_changed', { count: panels.length, updatedAt: nowIso, timestamp: Date.now() }).catch(() => {});
 
-    return { success: !error, source: 'cloud', count: panels.length, error: error?.message };
+    return { success: true, source: 'cloud', count: panels.length };
   } catch (err: any) {
     return { success: false, source: 'local', count: panels.length, error: err?.message };
   }
@@ -1195,16 +1378,17 @@ export async function saveCustomBatteriesToCloud(
   // 4. Persist to Supabase app_settings table for all users
   const client = initSupabase();
   if (!client) {
-    return { success: true, source: 'cloud', count: batteries.length };
+    return { success: false, source: 'local', count: batteries.length, error: 'Supabase client not configured' };
   }
 
   try {
+    const nowIso = new Date().toISOString();
     const { error } = await client
       .from('app_settings')
       .upsert({
         id: 'global_custom_batteries',
         value: batteries,
-        updated_at: new Date().toISOString()
+        updated_at: nowIso
       }, { onConflict: 'id' });
 
     if (error) {
@@ -1212,7 +1396,7 @@ export async function saveCustomBatteriesToCloud(
       return { success: false, source: 'local', count: batteries.length, error: error.message };
     }
 
-    broadcastCloudEvent('batteries_changed', { count: batteries.length, timestamp: Date.now() }).catch(() => {});
+    await broadcastCloudEvent('batteries_changed', { count: batteries.length, updatedAt: nowIso, timestamp: Date.now() }).catch(() => {});
 
     return { success: true, source: 'cloud', count: batteries.length };
   } catch (err: any) {
@@ -1333,9 +1517,12 @@ export async function syncAllDataNowFromCloud(): Promise<Record<string, { value:
   }
 }
 
+export type RealtimeSyncStatus = 'connected' | 'connecting' | 'reconnecting' | 'polling';
+
 /**
  * Realtime Subscription for Global Inverter, Panel & Battery Database Updates, Resources, Files & Licenses
- * Connects to Server-Sent Events (/api/events), Supabase Realtime, BroadcastChannel, and 5s Diff Poller
+ * Connects to Server-Sent Events (/api/events), Supabase Realtime WebSocket Broadcast + Postgres Changes,
+ * BroadcastChannel, and 3s Diff Poller with stale-response protection & auto-reconnect.
  */
 export function subscribeToGlobalDatabaseUpdates(callbacks: {
   onInvertersUpdate?: (inverters: Inverter[]) => void;
@@ -1349,6 +1536,7 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
   onLicensesUpdate?: (licenses: LicenseToken[]) => void;
   onAdminContactUpdate?: (contact: AdminContactConfig) => void;
   onMountingDatabaseUpdate?: (db: MountingDatabase) => void;
+  onRealtimeStatusChange?: (status: RealtimeSyncStatus) => void;
   onSystemPublished?: (payload: {
     timestamp: string;
     note?: string;
@@ -1364,11 +1552,35 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
 }): () => void {
   let isCleanedUp = false;
   let broadcastChannel: BroadcastChannel | null = null;
+  let paymentBroadcastChannel: BroadcastChannel | null = null;
+  let configBroadcastChannel: BroadcastChannel | null = null;
   let supabaseChannel: any = null;
   let eventSource: EventSource | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   const lastSeenUpdatedAt: Record<string, string> = {};
+  const seenEventIds = new Set<string>();
   let lastPublishedToastStamp = '';
   let hasCompletedInitialPoll = false;
+  const mySessionId = getMySessionId();
+
+  const shouldProcessBroadcast = (payload: any): boolean => {
+    const data = payload?.payload;
+    if (!data) return true;
+    const evId = data.eventId;
+    if (evId) {
+      if (seenEventIds.has(evId)) return false;
+      seenEventIds.add(evId);
+      if (seenEventIds.size > 100) {
+        const first = seenEventIds.values().next().value;
+        if (first) seenEventIds.delete(first);
+      }
+    }
+    // Skip self-echo from same browser tab since local state is already updated immediately
+    if (data.senderSessionId && data.senderSessionId === mySessionId) {
+      return false;
+    }
+    return true;
+  };
 
   const triggerPublishToastOnce = (stamp: string, note?: string, extra?: Record<string, any>) => {
     if (!callbacks.onSystemPublished) return;
@@ -1391,8 +1603,18 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
   ) => {
     if (isCleanedUp || value === undefined || value === null) return;
     const stamp = updatedAt || '';
-    if (!isInitialHydration && !forceApply && stamp && lastSeenUpdatedAt[id] === stamp) {
-      return;
+    const prevStamp = lastSeenUpdatedAt[id];
+
+    // Never regress to an older timestamp from an in-flight poll
+    if (stamp && prevStamp) {
+      const nextMs = new Date(stamp).getTime();
+      const prevMs = new Date(prevStamp).getTime();
+      if (!isNaN(nextMs) && !isNaN(prevMs)) {
+        if (nextMs < prevMs) return;
+        if (!isInitialHydration && !forceApply && nextMs === prevMs) return;
+      } else if (!isInitialHydration && !forceApply && stamp === prevStamp) {
+        return;
+      }
     }
     if (stamp) {
       lastSeenUpdatedAt[id] = stamp;
@@ -1431,8 +1653,9 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
         callbacks.onMountingDatabaseUpdate(value);
       }
     } else if (id === 'global_licenses' && Array.isArray(value) && callbacks.onLicensesUpdate) {
-      try { localStorage.setItem(STORAGE_ALL_LICENSES_KEY, JSON.stringify(value)); } catch (e) {}
-      callbacks.onLicensesUpdate(value);
+      const normalized = value.map((item: LicenseToken) => normalizeLicenseRecord(item));
+      try { localStorage.setItem(STORAGE_ALL_LICENSES_KEY, JSON.stringify(normalized)); } catch (e) {}
+      callbacks.onLicensesUpdate(normalized);
     } else if (id === 'global_system_published') {
       const pubStamp = value?.publishedAt || updatedAt || '';
       if (isInitialHydration) {
@@ -1443,11 +1666,15 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
     }
   };
 
-  // Smart Cloud Sync Puller (used by initial load, 3s poller, AND triggered instantly on every Realtime Broadcast)
+  // Smart Cloud Sync Puller with serialized follow-up queue (prevents older in-flight poll from clobbering newer broadcast)
   let syncInFlight: Promise<void> | null = null;
-  const syncSupabaseData = async (forceApply: boolean = false) => {
+  let queuedForceApply = false;
+  const syncSupabaseData = async (forceApply: boolean = false): Promise<void> => {
     if (isCleanedUp) return;
-    if (syncInFlight && !forceApply) return syncInFlight;
+    if (syncInFlight) {
+      if (forceApply) queuedForceApply = true;
+      return syncInFlight;
+    }
     const run = (async () => {
       const map = await syncAllDataNowFromCloud();
       if (map && !isCleanedUp) {
@@ -1477,6 +1704,10 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
       await run;
     } finally {
       if (syncInFlight === run) syncInFlight = null;
+      if (queuedForceApply && !isCleanedUp) {
+        queuedForceApply = false;
+        void syncSupabaseData(true);
+      }
     }
   };
 
@@ -1513,8 +1744,9 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
             try { localStorage.setItem(STORAGE_APP_BRANDING_KEY, JSON.stringify(data)); } catch (e) {}
             callbacks.onAppBrandingUpdate(data);
           } else if (type === 'licenses' && Array.isArray(data) && callbacks.onLicensesUpdate) {
-            try { localStorage.setItem(STORAGE_ALL_LICENSES_KEY, JSON.stringify(data)); } catch (e) {}
-            callbacks.onLicensesUpdate(data);
+            const normalized = data.map((item: LicenseToken) => normalizeLicenseRecord(item));
+            try { localStorage.setItem(STORAGE_ALL_LICENSES_KEY, JSON.stringify(normalized)); } catch (e) {}
+            callbacks.onLicensesUpdate(normalized);
           } else if (type === 'admin_contact' && data && callbacks.onAdminContactUpdate) {
             try { localStorage.setItem(STORAGE_ADMIN_CONTACT_KEY, JSON.stringify(data)); } catch (e) {}
             callbacks.onAdminContactUpdate(data);
@@ -1528,7 +1760,7 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
     } catch (e) {}
   }
 
-  // 2. Cross-Tab Broadcast Channel
+  // 2. Cross-Tab Broadcast Channels
   if (typeof BroadcastChannel !== 'undefined') {
     try {
       broadcastChannel = new BroadcastChannel('solar_database_sync');
@@ -1550,25 +1782,58 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
         } else if (data?.type === 'APP_BRANDING_UPDATED' && data.branding && callbacks.onAppBrandingUpdate) {
           callbacks.onAppBrandingUpdate(data.branding);
         } else if (data?.type === 'LICENSES_UPDATED' && Array.isArray(data.licenses) && callbacks.onLicensesUpdate) {
-          callbacks.onLicensesUpdate(data.licenses);
+          callbacks.onLicensesUpdate(data.licenses.map((item: LicenseToken) => normalizeLicenseRecord(item)));
         } else if (data?.type === 'ADMIN_CONTACT_UPDATED' && data.contact && callbacks.onAdminContactUpdate) {
           callbacks.onAdminContactUpdate(data.contact);
+        }
+      };
+
+      paymentBroadcastChannel = new BroadcastChannel('solar_payment_sync');
+      paymentBroadcastChannel.onmessage = (event) => {
+        if (isCleanedUp) return;
+        if (event.data?.type === 'PAYMENT_RECORDS_UPDATED' && Array.isArray(event.data.records) && callbacks.onPaymentRecordsUpdate) {
+          callbacks.onPaymentRecordsUpdate(event.data.records);
+        }
+      };
+
+      configBroadcastChannel = new BroadcastChannel('solar_config_sync');
+      configBroadcastChannel.onmessage = (event) => {
+        if (isCleanedUp) return;
+        if (event.data?.type === 'PAYMENT_CONFIG_UPDATED' && event.data.config && callbacks.onPaymentConfigUpdate) {
+          callbacks.onPaymentConfigUpdate(event.data.config);
         }
       };
     } catch (e) {}
   }
 
-  // 3. Supabase Realtime Channel (WebSocket Broadcast + Postgres Changes)
-  const client = initSupabase();
-  if (client) {
+  // 3. Supabase Realtime Channel (WebSocket Broadcast + Postgres Changes + Auto-Reconnect)
+  const attachSupabaseChannel = () => {
+    if (isCleanedUp) return;
+    const client = initSupabase();
+    if (!client) {
+      callbacks.onRealtimeStatusChange?.('polling');
+      return;
+    }
+
+    if (supabaseChannel) {
+      try { supabaseChannel.unsubscribe(); } catch (e) {}
+      supabaseChannel = null;
+    }
+
+    callbacks.onRealtimeStatusChange?.('connecting');
+
     try {
-      supabaseChannel = client.channel('solar_global_database_events');
+      supabaseChannel = client.channel('solar_global_database_events', {
+        config: {
+          broadcast: { self: false }
+        }
+      });
       sharedGlobalRealtimeChannel = supabaseChannel;
       sharedGlobalRealtimeSubscribed = false;
 
       supabaseChannel
         .on('broadcast', { event: 'inverters_changed' }, (payload: any) => {
-          if (isCleanedUp) return;
+          if (isCleanedUp || !shouldProcessBroadcast(payload)) return;
           if (payload?.payload?.inverters && Array.isArray(payload.payload.inverters) && callbacks.onInvertersUpdate) {
             try { localStorage.setItem(STORAGE_CUSTOM_INVERTERS_KEY, JSON.stringify(payload.payload.inverters)); } catch (e) {}
             callbacks.onInvertersUpdate(payload.payload.inverters);
@@ -1577,7 +1842,7 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           }
         })
         .on('broadcast', { event: 'panels_changed' }, (payload: any) => {
-          if (isCleanedUp) return;
+          if (isCleanedUp || !shouldProcessBroadcast(payload)) return;
           if (payload?.payload?.panels && Array.isArray(payload.payload.panels) && callbacks.onPanelsUpdate) {
             try { localStorage.setItem(STORAGE_CUSTOM_PANELS_KEY, JSON.stringify(payload.payload.panels)); } catch (e) {}
             callbacks.onPanelsUpdate(payload.payload.panels);
@@ -1586,7 +1851,7 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           }
         })
         .on('broadcast', { event: 'batteries_changed' }, (payload: any) => {
-          if (isCleanedUp) return;
+          if (isCleanedUp || !shouldProcessBroadcast(payload)) return;
           if (payload?.payload?.batteries && Array.isArray(payload.payload.batteries) && callbacks.onBatteriesUpdate) {
             try { localStorage.setItem(STORAGE_CUSTOM_BATTERIES_KEY, JSON.stringify(payload.payload.batteries)); } catch (e) {}
             callbacks.onBatteriesUpdate(payload.payload.batteries);
@@ -1595,16 +1860,17 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           }
         })
         .on('broadcast', { event: 'licenses_changed' }, (payload: any) => {
-          if (isCleanedUp) return;
+          if (isCleanedUp || !shouldProcessBroadcast(payload)) return;
           if (payload?.payload?.licenses && Array.isArray(payload.payload.licenses) && callbacks.onLicensesUpdate) {
-            try { localStorage.setItem(STORAGE_ALL_LICENSES_KEY, JSON.stringify(payload.payload.licenses)); } catch (e) {}
-            callbacks.onLicensesUpdate(payload.payload.licenses);
+            const normalized = payload.payload.licenses.map((item: LicenseToken) => normalizeLicenseRecord(item));
+            try { localStorage.setItem(STORAGE_ALL_LICENSES_KEY, JSON.stringify(normalized)); } catch (e) {}
+            callbacks.onLicensesUpdate(normalized);
           } else {
             syncSupabaseData(true);
           }
         })
         .on('broadcast', { event: 'admin_contact_changed' }, (payload: any) => {
-          if (isCleanedUp) return;
+          if (isCleanedUp || !shouldProcessBroadcast(payload)) return;
           if (payload?.payload?.contact && callbacks.onAdminContactUpdate) {
             try { localStorage.setItem(STORAGE_ADMIN_CONTACT_KEY, JSON.stringify(payload.payload.contact)); } catch (e) {}
             callbacks.onAdminContactUpdate(payload.payload.contact);
@@ -1613,7 +1879,7 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           }
         })
         .on('broadcast', { event: 'payment_config_changed' }, (payload: any) => {
-          if (isCleanedUp) return;
+          if (isCleanedUp || !shouldProcessBroadcast(payload)) return;
           if (payload?.payload?.config && callbacks.onPaymentConfigUpdate) {
             try { localStorage.setItem(STORAGE_PAYMENT_CONFIG_KEY, JSON.stringify(payload.payload.config)); } catch (e) {}
             callbacks.onPaymentConfigUpdate(payload.payload.config);
@@ -1622,7 +1888,7 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           }
         })
         .on('broadcast', { event: 'system_published' }, (payload: any) => {
-          if (isCleanedUp) return;
+          if (isCleanedUp || !shouldProcessBroadcast(payload)) return;
           const data = payload?.payload || {};
           // Pull fresh authoritative rows from Supabase REST API immediately, then show publish toast
           syncSupabaseData(true).then(() => {
@@ -1632,7 +1898,7 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           });
         })
         .on('broadcast', { event: 'mounting_database_changed' }, (payload: any) => {
-          if (isCleanedUp) return;
+          if (isCleanedUp || !shouldProcessBroadcast(payload)) return;
           const data = payload?.payload;
           if (data?.mountingDatabase && callbacks.onMountingDatabaseUpdate) {
             try { localStorage.setItem('solar_mounting_database_v1', JSON.stringify(data.mountingDatabase)); } catch (e) {}
@@ -1642,7 +1908,7 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           }
         })
         .on('broadcast', { event: 'resources_changed' }, (payload: any) => {
-          if (isCleanedUp) return;
+          if (isCleanedUp || !shouldProcessBroadcast(payload)) return;
           if (payload?.payload?.resources && Array.isArray(payload.payload.resources) && callbacks.onResourcesUpdate) {
             try { localStorage.setItem(STORAGE_ADMIN_RESOURCES_KEY, JSON.stringify(sanitizeResourcesForLocalCache(payload.payload.resources))); } catch (e) {}
             callbacks.onResourcesUpdate(payload.payload.resources);
@@ -1651,7 +1917,7 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           }
         })
         .on('broadcast', { event: 'spec_requests_changed' }, (payload: any) => {
-          if (isCleanedUp) return;
+          if (isCleanedUp || !shouldProcessBroadcast(payload)) return;
           if (payload?.payload?.requests && Array.isArray(payload.payload.requests) && callbacks.onSpecRequestsUpdate) {
             try { localStorage.setItem(STORAGE_SPEC_REQUESTS_KEY, JSON.stringify(payload.payload.requests)); } catch (e) {}
             callbacks.onSpecRequestsUpdate(payload.payload.requests);
@@ -1660,7 +1926,7 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           }
         })
         .on('broadcast', { event: 'payment_records_changed' }, (payload: any) => {
-          if (isCleanedUp) return;
+          if (isCleanedUp || !shouldProcessBroadcast(payload)) return;
           if (payload?.payload?.records && Array.isArray(payload.payload.records) && callbacks.onPaymentRecordsUpdate) {
             try { localStorage.setItem(STORAGE_PAYMENT_RECORDS_KEY, JSON.stringify(payload.payload.records)); } catch (e) {}
             callbacks.onPaymentRecordsUpdate(payload.payload.records);
@@ -1669,7 +1935,7 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           }
         })
         .on('broadcast', { event: 'app_branding_changed' }, (payload: any) => {
-          if (isCleanedUp) return;
+          if (isCleanedUp || !shouldProcessBroadcast(payload)) return;
           if (payload?.payload?.branding && callbacks.onAppBrandingUpdate) {
             try { localStorage.setItem(STORAGE_APP_BRANDING_KEY, JSON.stringify(payload.payload.branding)); } catch (e) {}
             callbacks.onAppBrandingUpdate(payload.payload.branding);
@@ -1685,10 +1951,26 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
           }
         })
         .subscribe((status: string) => {
+          if (isCleanedUp) return;
           sharedGlobalRealtimeSubscribed = status === 'SUBSCRIBED';
+          if (status === 'SUBSCRIBED') {
+            callbacks.onRealtimeStatusChange?.('connected');
+            // Pull latest snapshot right after subscribing so any missed changes while reconnecting are applied
+            syncSupabaseData(false);
+          } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+            callbacks.onRealtimeStatusChange?.('reconnecting');
+            if (reconnectTimer) clearTimeout(reconnectTimer);
+            reconnectTimer = setTimeout(() => {
+              if (!isCleanedUp) attachSupabaseChannel();
+            }, 4000);
+          }
         });
-    } catch (e) {}
-  }
+    } catch (e) {
+      callbacks.onRealtimeStatusChange?.('polling');
+    }
+  };
+
+  attachSupabaseChannel();
 
   // 4. Smart Periodic Cloud Sync Poller (every 3 seconds - guarantees real-time sync on GitHub Pages even behind strict Myanmar mobile networks)
   syncSupabaseData();
@@ -1700,7 +1982,10 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
   // Sync immediately when tab regains focus, becomes visible, or network reconnects
   const handleVisibility = () => {
     if (typeof document === 'undefined' || !document.hidden) {
-      syncSupabaseData();
+      syncSupabaseData(false);
+      if (!sharedGlobalRealtimeSubscribed && !isCleanedUp) {
+        attachSupabaseChannel();
+      }
     }
   };
   if (typeof window !== 'undefined') {
@@ -1712,6 +1997,7 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
   return () => {
     isCleanedUp = true;
     clearInterval(pollInterval);
+    if (reconnectTimer) clearTimeout(reconnectTimer);
     if (typeof window !== 'undefined') {
       window.removeEventListener('focus', handleVisibility);
       window.removeEventListener('online', handleVisibility);
@@ -1722,6 +2008,12 @@ export function subscribeToGlobalDatabaseUpdates(callbacks: {
     }
     if (broadcastChannel) {
       try { broadcastChannel.close(); } catch (e) {}
+    }
+    if (paymentBroadcastChannel) {
+      try { paymentBroadcastChannel.close(); } catch (e) {}
+    }
+    if (configBroadcastChannel) {
+      try { configBroadcastChannel.close(); } catch (e) {}
     }
     if (supabaseChannel) {
       if (sharedGlobalRealtimeChannel === supabaseChannel) {
@@ -2549,19 +2841,17 @@ export async function fetchAdminContactFromCloud(): Promise<AdminContactConfig> 
   return cached;
 }
 
-export async function saveAdminContactToCloud(contact: AdminContactConfig): Promise<void> {
+export async function saveAdminContactToCloud(contact: AdminContactConfig): Promise<{ success: boolean; error?: string }> {
   try {
     localStorage.setItem(STORAGE_ADMIN_CONTACT_KEY, JSON.stringify(contact));
   } catch (e) {}
 
-  // 1. Server API
-  try {
-    await fetch('/api/admin-contact', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contact })
-    });
-  } catch (e) {}
+  // 1. Server API (non-blocking for GitHub Pages)
+  fetch('/api/admin-contact', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contact })
+  }).catch(() => {});
 
   // 2. Cross-tab broadcast
   if (typeof BroadcastChannel !== 'undefined') {
@@ -2574,18 +2864,27 @@ export async function saveAdminContactToCloud(contact: AdminContactConfig): Prom
 
   // 3. Supabase Cloud (Store in app_settings under both global_admin_contact and admin_contact_config)
   const supabase = initSupabase();
-  if (supabase) {
-    try {
-      const nowIso = new Date().toISOString();
-      await supabase
-        .from('app_settings')
-        .upsert([
-          { id: 'global_admin_contact', value: contact, updated_at: nowIso },
-          { id: 'admin_contact_config', value: contact, updated_at: nowIso }
-        ], { onConflict: 'id' });
-    } catch (e) {}
+  if (!supabase) {
+    return { success: false, error: 'Supabase client not configured' };
+  }
 
-    broadcastCloudEvent('admin_contact_changed', { contact, timestamp: Date.now() }).catch(() => {});
+  try {
+    const nowIso = new Date().toISOString();
+    const { error } = await supabase
+      .from('app_settings')
+      .upsert([
+        { id: 'global_admin_contact', value: contact, updated_at: nowIso },
+        { id: 'admin_contact_config', value: contact, updated_at: nowIso }
+      ], { onConflict: 'id' });
+
+    if (error) {
+      return { success: false, error: error.message };
+    }
+
+    await broadcastCloudEvent('admin_contact_changed', { contact, updatedAt: nowIso, timestamp: Date.now() }).catch(() => {});
+    return { success: true };
+  } catch (e: any) {
+    return { success: false, error: e?.message || 'Supabase save failed' };
   }
 }
 
@@ -2697,21 +2996,25 @@ export async function generateLicenseOnServer(params: {
         ...params,
         duration: requestedDuration,
         deviceLimit: requestedDeviceLimit
-      })
+      }),
+      signal: AbortSignal.timeout(5000)
     });
     if (res.ok) {
-      const json = await res.json();
-      if (json.success && json.license) {
-        const serverLic = normalizeLicenseRecord(json.license);
-        // Double-check server honored exact requested duration before accepting
-        if (serverLic.duration === requestedDuration) {
-          createdLicense = serverLic;
+      const contentType = res.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        const json = await res.json();
+        if (json.success && json.license) {
+          const serverLic = normalizeLicenseRecord(json.license);
+          // Double-check server honored exact requested duration before accepting
+          if (serverLic.duration === requestedDuration) {
+            createdLicense = serverLic;
+          }
         }
       }
     }
   } catch (e) {}
 
-  // Fallback client generation if server route is not reachable (e.g. Admin on GitHub Pages)
+  // Direct client generation when Express backend is not reachable (e.g. Admin on GitHub Pages)
   if (!createdLicense) {
     const spec = LICENSE_PLAN_SPECS[requestedDuration];
     const days = spec.days;
@@ -2739,10 +3042,19 @@ export async function generateLicenseOnServer(params: {
     };
   }
 
-  // Always sync to Supabase `global_licenses` so all online devices see it immediately!
+  // Always sync to Supabase `global_licenses` and verify cloud persistence so buyers can activate immediately!
   const currentLicenses = await fetchLicensesFromCloud();
-  const updated = [createdLicense, ...currentLicenses.filter(l => l.id !== createdLicense!.id && l.token.toUpperCase() !== createdLicense!.token.toUpperCase())];
-  await saveLicensesToCloud(updated);
+  const updated = [
+    createdLicense,
+    ...currentLicenses.filter(l => l.id !== createdLicense!.id && l.token.toUpperCase() !== createdLicense!.token.toUpperCase())
+  ];
+  const saveRes = await saveLicensesToCloud(updated);
+  if (!saveRes.success) {
+    return {
+      success: false,
+      error: saveRes.error || 'Supabase Cloud တွင် လိုင်စင် သိမ်းဆည်းမှု မအောင်မြင်ပါ'
+    };
+  }
 
   return { success: true, license: createdLicense };
 }
@@ -2757,9 +3069,18 @@ export async function activateLicenseOnDevice(token: string): Promise<{
   const deviceModel = getClientDevice();
   const cleaned = extractLicenseTokenFromInput(token);
 
-  setLicenseManuallyDeactivated(false);
+  if (!cleaned) {
+    return {
+      success: false,
+      error: 'empty_token',
+      message: 'လိုင်စင်ကုဒ် ထည့်သွင်းပေးပါ (Please enter a License Key)'
+    };
+  }
 
-  // 1. Primary Cloud Validation via Supabase `global_licenses` (works 100% online on GitHub Pages without VPN!)
+  let cloudReachable = false;
+  let serverExplicitlyNotFound = false;
+
+  // 1. Authoritative Cloud Validation via Supabase `global_licenses` (works 100% online on GitHub Pages without VPN!)
   const supabase = initSupabase();
   if (supabase) {
     try {
@@ -2769,8 +3090,12 @@ export async function activateLicenseOnDevice(token: string): Promise<{
         .eq('id', 'global_licenses')
         .maybeSingle();
 
-      if (!error && Array.isArray(data?.value)) {
-        const list: LicenseToken[] = data.value.map((item: LicenseToken) => normalizeLicenseRecord(item));
+      if (!error) {
+        cloudReachable = true;
+        const list: LicenseToken[] = Array.isArray(data?.value)
+          ? data.value.map((item: LicenseToken) => normalizeLicenseRecord(item))
+          : [];
+
         const licIndex = list.findIndex(l =>
           l.token.toUpperCase() === cleaned ||
           l.id === cleaned ||
@@ -2788,7 +3113,7 @@ export async function activateLicenseOnDevice(token: string): Promise<{
             };
           }
 
-          if (new Date(lic.expiresAt).getTime() < Date.now() || lic.status === 'expired') {
+          if (new Date(lic.expiresAt).getTime() <= Date.now() || lic.status === 'expired') {
             lic.status = 'expired';
             list[licIndex] = lic;
             await saveLicensesToCloud(list);
@@ -2815,16 +3140,24 @@ export async function activateLicenseOnDevice(token: string): Promise<{
               lic.unboundDeviceIds = lic.unboundDeviceIds.filter(id => id !== deviceId);
             }
             list[licIndex] = lic;
-            await saveLicensesToCloud(list);
+            let saveRes = await saveLicensesToCloud(list);
+            if (!saveRes.success) {
+              saveRes = await saveLicensesToCloud(list);
+            }
+            setLicenseManuallyDeactivated(false);
             saveStoredActiveLicense(lic);
-            return { success: true, license: lic };
+            return {
+              success: true,
+              license: lic,
+              message: `🎉 PRO License အောင်မြင်စွာ ပြန်လည်ချိတ်ဆက်ပြီးပါပြီ! (${formatLicensePlanLabel(lic.duration, 'my')})`
+            };
           }
 
           if (bound.length >= (lic.deviceLimit || 1)) {
             return {
               success: false,
               error: 'device_limit_exceeded',
-              message: `ခွင့်ပြုထားသည့် စက်အရေအတွက် (${lic.deviceLimit} လုံး) ပြည့်သွားပါပြီ။ အခြားစက်တွင် အသုံးပြုလိုပါက Admin ထံ ဆက်သွယ်ပါ။`
+              message: `ခွင့်ပြုထားသည့် စက်အရေအတွက် (${lic.deviceLimit} လုံး) ပြည့်သွားပါပြီ။ အရင်စက်မှ Deactivate လုပ်ပါ သို့မဟုတ် Admin ထံ ဆက်သွယ်ပါ။`
             };
           }
 
@@ -2839,7 +3172,20 @@ export async function activateLicenseOnDevice(token: string): Promise<{
             lic.unboundDeviceIds = lic.unboundDeviceIds.filter(id => id !== deviceId);
           }
           list[licIndex] = lic;
-          await saveLicensesToCloud(list);
+
+          let saveRes = await saveLicensesToCloud(list);
+          if (!saveRes.success) {
+            saveRes = await saveLicensesToCloud(list);
+          }
+          if (!saveRes.success) {
+            return {
+              success: false,
+              error: 'cloud_save_failed',
+              message: `Supabase Cloud ချိတ်ဆက်မှု အခက်အခဲရှိနေပါသည် (${saveRes.error || 'Network error'})။ ခဏနေပြီး ထပ်မံစမ်းကြည့်ပါ။`
+            };
+          }
+
+          setLicenseManuallyDeactivated(false);
           saveStoredActiveLicense(lic);
 
           notifyTelegramOnClientActivation(lic, deviceModel, deviceId).catch(() => {});
@@ -2867,103 +3213,111 @@ export async function activateLicenseOnDevice(token: string): Promise<{
       const json = await res.json();
       if (json.success && json.license) {
         const normalizedLic = normalizeLicenseRecord(json.license);
+        setLicenseManuallyDeactivated(false);
         saveStoredActiveLicense(normalizedLic);
         // Ensure Supabase global_licenses is also up-to-date
         const current = await fetchLicensesFromCloud();
         const merged = [normalizedLic, ...current.filter(l => l.token.toUpperCase() !== normalizedLic.token.toUpperCase())];
-        saveLicensesToCloud(merged).catch(() => {});
-        return { success: true, license: normalizedLic };
+        await saveLicensesToCloud(merged).catch(() => {});
+        return {
+          success: true,
+          license: normalizedLic,
+          message: `🎉 PRO License အောင်မြင်စွာ ဖွင့်ပြီးပါပြီ! (${formatLicensePlanLabel(normalizedLic.duration, 'my')})`
+        };
       } else if (json.error === 'revoked' || json.error === 'expired' || json.error === 'device_limit_exceeded') {
         return {
           success: false,
           error: json.error,
           message: json.message || 'လိုင်စင်ဖွင့်ခြင်း မအောင်မြင်ပါ'
         };
+      } else if (json.error === 'not_found') {
+        serverExplicitlyNotFound = true;
       }
     }
   } catch (e) {}
 
-  // 3. OFFLINE & VPN-FREE FALLBACK ACTIVATION (for valid format tokens generated offline or before sync):
-  const tokenRegex = /^SOLAR-PRO-(1W|1M|3M|6M|1Y|LIFE)-(1D|2D)-[A-Z0-9]{4}-[A-Z0-9]{4}$/i;
-  const match = cleaned.match(tokenRegex);
-
-  if (match) {
-    const durCode = match[1].toUpperCase();
-    const devCode = match[2].toUpperCase();
-    const durationStr: LicenseToken['duration'] = CODE_TO_DURATION[durCode] || '1_month';
-    const spec = LICENSE_PLAN_SPECS[durationStr];
-    const days = spec.days;
-    const devLimit: 1 | 2 = devCode === '2D' ? 2 : 1;
-    const nowIso = new Date().toISOString();
-
-    const offlineLicense: LicenseToken = {
-      id: `lic_offline_${Date.now()}`,
-      token: cleaned,
-      customerName: 'Valued Pro Engineer',
-      duration: durationStr,
-      durationDays: days,
-      deviceLimit: devLimit,
-      boundDevices: [{
-        deviceId,
-        deviceModel,
-        activatedAt: nowIso,
-        lastSeenAt: nowIso
-      }],
-      createdAt: nowIso,
-      expiresAt: new Date(Date.now() + days * 86400000).toISOString(),
-      status: 'active',
-      note: 'Direct Activation (Auto-Synced to Cloud)'
-    };
-
-    saveStoredActiveLicense(offlineLicense);
-
-    // Auto-register into Supabase global_licenses if online so Admin can manage it live
-    if (supabase) {
-      fetchLicensesFromCloud().then(existing => {
-        if (!existing.some(l => l.token.toUpperCase() === cleaned)) {
-          saveLicensesToCloud([offlineLicense, ...existing]).catch(() => {});
-        }
-      }).catch(() => {});
-    }
-
-    // Real-time Telegram notification to Admin when user activates on GitHub Pages
-    notifyTelegramOnClientActivation(offlineLicense, deviceModel, deviceId).catch(() => {});
-
+  // 3. Authoritative rejection: if Supabase Cloud or Server was reachable and the key does NOT exist,
+  // NEVER invent or resurrect a fake/deleted key!
+  if (cloudReachable || serverExplicitlyNotFound) {
     return {
-      success: true,
-      license: offlineLicense,
-      message: `🎉 PRO License အောင်မြင်စွာ ဖွင့်ပြီးပါပြီ! (${spec.labelMy})`
+      success: false,
+      error: 'not_found',
+      message: 'ဤလိုင်စင်ကုဒ်ကို စနစ်တွင် မတွေ့ရှိပါ (သို့မဟုတ် ဖျက်သိမ်းထားပါသည်)။ Admin ထံမှ ရရှိသော မှန်ကန်သည့် Key ကို ထည့်သွင်းပါ။'
     };
   }
 
-  // 4. Check local cached licenses list
+  // 4. Genuine Offline fallback ONLY when both Supabase and Server are unreachable: check local cached licenses
   try {
     const cachedRaw = localStorage.getItem(STORAGE_ALL_LICENSES_KEY);
     if (cachedRaw) {
       const cachedList: LicenseToken[] = JSON.parse(cachedRaw).map((item: LicenseToken) => normalizeLicenseRecord(item));
       const found = cachedList.find(l => l.token.toUpperCase() === cleaned || l.id === cleaned);
-      if (found && found.status === 'active' && new Date(found.expiresAt).getTime() > Date.now()) {
+      if (found) {
+        if (found.status === 'revoked') {
+          return { success: false, error: 'revoked', message: 'ဤလိုင်စင်ကို Admin မှ ပိတ်ထားပါသည် (License Revoked)' };
+        }
+        if (found.status === 'expired' || new Date(found.expiresAt).getTime() <= Date.now()) {
+          return { success: false, error: 'expired', message: 'ဤလိုင်စင် သက်တမ်းကုန်ဆုံးသွားပါပြီ (License Expired)' };
+        }
+        setLicenseManuallyDeactivated(false);
         saveStoredActiveLicense(found);
-        return { success: true, license: found };
+        return {
+          success: true,
+          license: found,
+          message: `🎉 PRO License အောင်မြင်စွာ ဖွင့်ပြီးပါပြီ! (${formatLicensePlanLabel(found.duration, 'my')})`
+        };
       }
     }
   } catch (err) {}
 
   return {
     success: false,
-    error: 'invalid_token',
-    message: 'လိုင်စင်ကုဒ် မှားယွင်းနေပါသည်။ (ဥပမာ ပုံစံ: SOLAR-PRO-1W-1D-XXXX-YYYY သို့မဟုတ် SOLAR-PRO-1M-1D-XXXX-YYYY)'
+    error: 'network_or_invalid',
+    message: 'အင်တာနက် ချိတ်ဆက်မှု စစ်ဆေးပါ သို့မဟုတ် မှန်ကန်သော လိုင်စင်ကုဒ် ထည့်သွင်းပါ (Unable to verify license key online)'
   };
 }
 
-export async function unbindLicenseDevice(licenseId: string, deviceId?: string): Promise<{ success: boolean; license?: LicenseToken }> {
+/**
+ * Cleanly deactivates the active license on THIS device AND unbinds this device slot in Supabase Cloud
+ * so the user can move their license to another phone/PC immediately and Admin sees updated slot count live.
+ */
+export async function deactivateLicenseOnDevice(activeLicense?: LicenseToken | null): Promise<{ success: boolean; error?: string }> {
+  const deviceId = getMyDeviceId();
+  setLicenseManuallyDeactivated(true);
+  saveStoredActiveLicense(null);
+
+  if (!activeLicense) {
+    return { success: true };
+  }
+
   try {
-    await fetch('/api/license/unbind-device', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ licenseId, deviceId: deviceId || 'all' })
-    });
-  } catch (e) {}
+    const licenses = await fetchLicensesFromCloud();
+    const licIdx = licenses.findIndex(
+      l => l.id === activeLicense.id || l.token.toUpperCase() === activeLicense.token.toUpperCase()
+    );
+    if (licIdx !== -1) {
+      const target = { ...licenses[licIdx] };
+      const prevBound = Array.isArray(target.boundDevices) ? target.boundDevices : [];
+      const nextBound = prevBound.filter(b => b.deviceId !== deviceId);
+      if (nextBound.length !== prevBound.length) {
+        target.boundDevices = nextBound;
+        licenses[licIdx] = target;
+        const saveRes = await saveLicensesToCloud(licenses);
+        return { success: saveRes.success, error: saveRes.error };
+      }
+    }
+    return { success: true };
+  } catch (err: any) {
+    return { success: false, error: err?.message };
+  }
+}
+
+export async function unbindLicenseDevice(licenseId: string, deviceId?: string): Promise<{ success: boolean; license?: LicenseToken; error?: string }> {
+  fetch('/api/license/unbind-device', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ licenseId, deviceId: deviceId || 'all' })
+  }).catch(() => {});
 
   const licenses = await fetchLicensesFromCloud();
   const lic = licenses.find(l => l.id === licenseId || l.token === licenseId);
@@ -2976,20 +3330,18 @@ export async function unbindLicenseDevice(licenseId: string, deviceId?: string):
       const prevUnbound = Array.isArray(lic.unboundDeviceIds) ? lic.unboundDeviceIds : [];
       lic.unboundDeviceIds = Array.from(new Set([...prevUnbound, deviceId]));
     }
-    await saveLicensesToCloud(licenses);
-    return { success: true, license: lic };
+    const saveRes = await saveLicensesToCloud(licenses);
+    return { success: saveRes.success, license: lic, error: saveRes.error };
   }
-  return { success: false };
+  return { success: false, error: 'License not found' };
 }
 
-export async function extendLicenseDuration(licenseId: string, days: number = 30): Promise<{ success: boolean; license?: LicenseToken }> {
-  try {
-    await fetch('/api/license/extend', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ licenseId, days })
-    });
-  } catch (e) {}
+export async function extendLicenseDuration(licenseId: string, days: number = 30): Promise<{ success: boolean; license?: LicenseToken; error?: string }> {
+  fetch('/api/license/extend', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ licenseId, days })
+  }).catch(() => {});
 
   const licenses = await fetchLicensesFromCloud();
   const lic = licenses.find(l => l.id === licenseId || l.token === licenseId);
@@ -2999,40 +3351,36 @@ export async function extendLicenseDuration(licenseId: string, days: number = 30
     lic.expiresAt = new Date(base + days * 86400000).toISOString();
     lic.status = 'active';
     lic.manuallyExtended = true;
-    await saveLicensesToCloud(licenses);
-    return { success: true, license: lic };
+    const saveRes = await saveLicensesToCloud(licenses);
+    return { success: saveRes.success, license: lic, error: saveRes.error };
   }
-  return { success: false };
+  return { success: false, error: 'License not found' };
 }
 
-export async function updateLicenseStatus(licenseId: string, status: LicenseToken['status']): Promise<{ success: boolean; license?: LicenseToken }> {
-  try {
-    await fetch('/api/license/status', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ licenseId, status })
-    });
-  } catch (e) {}
+export async function updateLicenseStatus(licenseId: string, status: LicenseToken['status']): Promise<{ success: boolean; license?: LicenseToken; error?: string }> {
+  fetch('/api/license/status', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ licenseId, status })
+  }).catch(() => {});
 
   const licenses = await fetchLicensesFromCloud();
   const lic = licenses.find(l => l.id === licenseId || l.token === licenseId);
   if (lic) {
     lic.status = status;
-    await saveLicensesToCloud(licenses);
-    return { success: true, license: lic };
+    const saveRes = await saveLicensesToCloud(licenses);
+    return { success: saveRes.success, license: lic, error: saveRes.error };
   }
-  return { success: false };
+  return { success: false, error: 'License not found' };
 }
 
-export async function deleteLicenseFromCloud(licenseId: string): Promise<{ success: boolean }> {
-  try {
-    await fetch(`/api/license/${licenseId}`, { method: 'DELETE' });
-  } catch (e) {}
+export async function deleteLicenseFromCloud(licenseId: string): Promise<{ success: boolean; error?: string }> {
+  fetch(`/api/license/${licenseId}`, { method: 'DELETE' }).catch(() => {});
 
   const licenses = await fetchLicensesFromCloud();
   const updated = licenses.filter(l => l.id !== licenseId && l.token !== licenseId);
-  await saveLicensesToCloud(updated);
-  return { success: true };
+  const saveRes = await saveLicensesToCloud(updated);
+  return { success: saveRes.success, error: saveRes.error };
 }
 
 // Publish Live Update to All Users (Direct to Supabase Cloud & Express Server)
@@ -3054,9 +3402,11 @@ export async function publishLiveSystemUpdate(
   const publishNote = note || "Admin published live update";
   let cloudError: string | undefined;
 
-  // 1. Persist ALL equipment datasets, files, branding, contacts, and licenses to Supabase Cloud
+  // 1. Persist provided equipment datasets, files, branding & contacts directly to Supabase Cloud
   const supabase = initSupabase();
-  if (supabase) {
+  if (!supabase) {
+    cloudError = 'Supabase client not configured';
+  } else {
     try {
       const upsertRows: Array<{ id: string; value: any; updated_at: string }> = [
         {
@@ -3129,35 +3479,28 @@ export async function publishLiveSystemUpdate(
       if (error) {
         cloudError = error.message;
         console.warn('Supabase publish update error:', error.message);
+      } else {
+        // Broadcast lightweight live signal via Supabase Realtime so all connected GitHub clients pull fresh data in <200ms
+        await broadcastCloudEvent('system_published', {
+          publishedAt,
+          note: publishNote,
+          timestamp: Date.now()
+        }).catch(() => {});
       }
-
-      // Broadcast lightweight live signal via Supabase Realtime so all connected GitHub clients pull fresh data in <300ms
-      broadcastCloudEvent('system_published', {
-        publishedAt,
-        note: publishNote,
-        timestamp: Date.now()
-      }).catch(() => {});
     } catch (e: any) {
       cloudError = e?.message;
       console.warn('Supabase publish update error:', e);
     }
   }
 
-  // 2. Post to Express Server API (if reachable) — omit licenses so server never overwrites global_licenses
+  // 2. Post to Express Server API (if reachable, non-blocking mirror) — omit licenses & tell server Supabase already synced
   try {
     const { licenses: _omitLicenses, ...safeServerPayload } = extraPayload || {};
-    const res = await fetch('/api/publish-update', {
+    fetch('/api/publish-update', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ note: publishNote, ...safeServerPayload })
-    });
-    if (res.ok) {
-      const contentType = res.headers.get('content-type') || '';
-      if (contentType.includes('application/json')) {
-        const json = await res.json();
-        return { success: !cloudError, publishedAt: json.publishedAt || publishedAt, error: cloudError };
-      }
-    }
+      body: JSON.stringify({ note: publishNote, skipSupabaseMirror: !cloudError, ...safeServerPayload })
+    }).catch(() => {});
   } catch (e) {}
 
   return { success: !cloudError, publishedAt, error: cloudError };

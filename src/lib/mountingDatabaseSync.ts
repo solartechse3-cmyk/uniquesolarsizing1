@@ -3,7 +3,7 @@ import { MountingDatabase, MountingPanelItem, RoofComponentItem, GroundComponent
 import { INITIAL_MOUNTING_DATABASE } from '../data/mountingDatabaseDefaults';
 import { initSupabase, broadcastCloudEvent } from './supabase';
 
-const STORAGE_MOUNTING_DB_KEY = 'solar_mounting_database_v1';
+export const STORAGE_MOUNTING_DB_KEY = 'solar_mounting_database_v1';
 
 /**
  * Clean string for fuzzy header matching
@@ -506,9 +506,13 @@ export async function publishMountingDatabaseToCloud(
     localStorage.setItem(STORAGE_MOUNTING_DB_KEY, JSON.stringify(updatedDb));
   } catch (e) {}
 
+  let cloudError: string | undefined;
+
   // 2. Persist to Supabase Cloud for all GitHub Pages & Web clients
   const client = initSupabase();
-  if (client) {
+  if (!client) {
+    cloudError = 'Supabase client not configured';
+  } else {
     try {
       const { error } = await client
         .from('app_settings')
@@ -519,40 +523,41 @@ export async function publishMountingDatabaseToCloud(
         }, { onConflict: 'id' });
 
       if (error) {
-        console.warn('Supabase mounting database save notice:', error.message);
+        cloudError = error.message;
+        console.warn('Supabase mounting database save error:', error.message);
+      } else {
+        // Broadcast lightweight live signal via Supabase Realtime so clients pull fresh data immediately
+        await broadcastCloudEvent('mounting_database_changed', {
+          lastUpdated: updatedDb.lastUpdated,
+          timestamp: Date.now()
+        }).catch(() => {});
       }
-
-      // Broadcast lightweight live signal via Supabase Realtime so clients pull fresh data immediately
-      broadcastCloudEvent('mounting_database_changed', {
-        lastUpdated: updatedDb.lastUpdated,
-        timestamp: Date.now()
-      }).catch(() => {});
-    } catch (e) {
-      console.warn('Supabase mounting database save notice:', e);
+    } catch (e: any) {
+      cloudError = e?.message || 'Supabase mounting database network error';
+      console.warn('Supabase mounting database save exception:', e);
     }
   }
 
-  // 3. Post to central Express backend (saves to disk in data/app_storage.json and broadcasts to all clients)
-  try {
-    const res = await fetch('/api/data/mounting_database', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ data: updatedDb })
-    });
-
-    // Also notify local browser tabs
-    if (typeof BroadcastChannel !== 'undefined') {
-      try {
-        const bc = new BroadcastChannel('solar_mounting_db_sync');
-        bc.postMessage({ type: 'MOUNTING_DB_PUBLISHED', data: updatedDb, timestamp: Date.now() });
-        setTimeout(() => bc.close(), 1000);
-      } catch (e) {}
-    }
-
-    return { success: true, timestamp: updatedDb.lastUpdated };
-  } catch (err: any) {
-    return { success: true, timestamp: updatedDb.lastUpdated };
+  // 3. Notify local browser tabs immediately
+  if (typeof BroadcastChannel !== 'undefined') {
+    try {
+      const bc = new BroadcastChannel('solar_mounting_db_sync');
+      bc.postMessage({ type: 'MOUNTING_DB_PUBLISHED', data: updatedDb, timestamp: Date.now() });
+      setTimeout(() => bc.close(), 1000);
+    } catch (e) {}
   }
+
+  // 4. Mirror to Express backend when running locally (non-blocking for GitHub Pages)
+  fetch('/api/data/mounting_database', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ data: updatedDb })
+  }).catch(() => {});
+
+  if (cloudError) {
+    return { success: false, error: cloudError, timestamp: updatedDb.lastUpdated };
+  }
+  return { success: true, timestamp: updatedDb.lastUpdated };
 }
 
 /**

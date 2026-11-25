@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { AdminContactConfig, LicenseToken, SupportedLanguage } from '../types';
+import { extractLicenseTokenFromInput } from '../lib/supabase';
 
 interface ViberTelegramPurchaseBannerProps {
   adminContact: AdminContactConfig;
@@ -74,7 +75,7 @@ export const ViberTelegramPurchaseBanner: React.FC<ViberTelegramPurchaseBannerPr
 
   const handleManualActivate = async (e: React.FormEvent) => {
     e.preventDefault();
-    const token = inputToken.trim();
+    const token = extractLicenseTokenFromInput(inputToken);
     if (!token) return;
 
     setIsActivating(true);

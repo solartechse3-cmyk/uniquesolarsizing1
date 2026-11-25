@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   Shield, 
   CheckCircle2, 
@@ -65,6 +65,11 @@ import {
   saveAdminResourcesToCloud, 
   saveAppBrandingToCloud, 
   DEFAULT_APP_BRANDING,
+  DEFAULT_SUPABASE_URL,
+  DEFAULT_SUPABASE_ANON_KEY,
+  testSupabaseConnection,
+  SupabaseDiagnosticResult,
+  RealtimeSyncStatus,
   exportFullDatabaseBackup,
   downloadFullBackupFile,
   importFullDatabaseBackup,
@@ -78,7 +83,7 @@ import {
   syncAllLicensesToGoogleSheet, 
   exportLicensesAsCSV 
 } from '../lib/googleSheetsService';
-import { parseSolarPanelsFile, parseInvertersFile } from '../lib/spreadsheetParser';
+import { parseSolarPanelsFile, parseInvertersFile, parseBatteriesFile } from '../lib/spreadsheetParser';
 
 interface AdminPanelModalProps {
   isOpen: boolean;
@@ -86,7 +91,7 @@ interface AdminPanelModalProps {
   lang: SupportedLanguage;
   theme: 'light' | 'dark';
   adminContact: AdminContactConfig;
-  onUpdateAdminContact: (contact: AdminContactConfig) => void;
+  onUpdateAdminContact: (contact: AdminContactConfig) => Promise<{ success: boolean; error?: string }> | void;
   licenses: LicenseToken[];
   onRefreshLicenses?: () => void;
   onGenerateLicense: (params: { customerName: string; duration: LicenseToken['duration']; deviceLimit: 1 | 2; note?: string }) => Promise<{ success: boolean; license?: LicenseToken; error?: string }>;
@@ -94,26 +99,36 @@ interface AdminPanelModalProps {
   onExtendLicense: (licenseId: string, days: number) => Promise<void>;
   onUpdateLicenseStatus: (licenseId: string, status: LicenseToken['status']) => Promise<void>;
   onDeleteLicense: (licenseId: string) => Promise<void>;
-  onPublishLiveUpdate: (note?: string) => Promise<{ success: boolean; publishedAt?: string }>;
+  onPublishLiveUpdate: (note?: string) => Promise<{ success: boolean; publishedAt?: string; error?: string }>;
   isLocked: boolean;
   onToggleLock: (locked: boolean) => void;
   resources: AdminResourceFile[];
-  onAddResource: (resource: Omit<AdminResourceFile, 'id' | 'uploadedAt' | 'downloadsCount'>) => void;
+  onAddResource: (resource: Omit<AdminResourceFile, 'id' | 'uploadedAt' | 'downloadsCount'>) => Promise<{ success: boolean; error?: string }> | void;
   onDeleteResource: (id: string) => void;
   specRequests: SpecRequest[];
   onUpdateSpecRequestStatus: (requestId: string, status: SpecRequest['status'], adminReply?: string) => void;
   onDeleteSpecRequest: (requestId: string) => void;
   activePresences: UserPresence[];
   supabaseConfig: SupabaseConfig;
+  realtimeStatus?: RealtimeSyncStatus;
   onUpdateSupabaseConfig: (cfg: SupabaseConfig) => void;
+  onPullLatestFromCloud?: () => Promise<{
+    success: boolean;
+    inverters: number;
+    panels: number;
+    batteries: number;
+    licenses: number;
+    resources: number;
+    error?: string;
+  }>;
   customInverters?: Inverter[];
-  onUpdateCustomInverters?: (inverters: Inverter[]) => void;
+  onUpdateCustomInverters?: (inverters: Inverter[]) => Promise<{ success: boolean; error?: string; count?: number }> | void;
   customPanels?: PanelPreset[];
-  onUpdateCustomPanels?: (panels: PanelPreset[]) => void;
+  onUpdateCustomPanels?: (panels: PanelPreset[]) => Promise<{ success: boolean; error?: string; count?: number }> | void;
   customBatteries?: BatteryPreset[];
-  onUpdateCustomBatteries?: (batteries: BatteryPreset[]) => void;
+  onUpdateCustomBatteries?: (batteries: BatteryPreset[]) => Promise<{ success: boolean; error?: string; count?: number }> | void;
   appBranding?: AppBranding;
-  onUpdateAppBranding?: (branding: AppBranding) => void;
+  onUpdateAppBranding?: (branding: AppBranding) => Promise<{ success: boolean; error?: string }> | void;
   onOpenMountingDatabase?: () => void;
   onShowToast?: (msg: { text: string; type: 'success' | 'error' | 'info' }) => void;
   adminPassword?: string;
@@ -147,7 +162,9 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
   onDeleteSpecRequest,
   activePresences = [],
   supabaseConfig,
+  realtimeStatus = 'connecting',
   onUpdateSupabaseConfig,
+  onPullLatestFromCloud,
   customInverters = [],
   onUpdateCustomInverters,
   customPanels = [],
@@ -206,9 +223,17 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
   const [resFileSize, setResFileSize] = useState('');
   const [resFileType, setResFileType] = useState('');
   const [resFileData, setResFileData] = useState<string | undefined>(undefined);
+  const [isUploadingResource, setIsUploadingResource] = useState(false);
+  const resourceFileInputRef = useRef<HTMLInputElement>(null);
 
-  // Supabase Form State
+  // Database Batch Upload & Cloud Sync State
+  const [uploadingDbType, setUploadingDbType] = useState<'inverters' | 'panels' | 'batteries' | 'pull' | null>(null);
+  const [dbUploadFeedback, setDbUploadFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  // Supabase Form & Diagnostics State
   const [supabaseForm, setSupabaseForm] = useState<SupabaseConfig>(supabaseConfig);
+  const [isTestingSupabase, setIsTestingSupabase] = useState(false);
+  const [supabaseDiag, setSupabaseDiag] = useState<SupabaseDiagnosticResult | null>(null);
 
   // Telegram Bot Form State
   const [telegramForm, setTelegramForm] = useState<TelegramBotConfig>(telegramConfig || DEFAULT_INITIAL_TELEGRAM_BOT_CONFIG);
@@ -266,6 +291,10 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
   useEffect(() => {
     setContactForm(adminContact);
   }, [adminContact]);
+
+  useEffect(() => {
+    setSupabaseForm(supabaseConfig);
+  }, [supabaseConfig]);
 
   useEffect(() => {
     if (appBranding) {
@@ -340,7 +369,7 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
           });
         }
 
-        // Auto-log to Google Sheet if Webhook is configured
+          // Auto-log to Google Sheet if Webhook is configured
         try {
           appendLicenseRecordToSheet(res.license, typeof window !== 'undefined' ? window.location.origin : undefined)
             .then((sheetRes) => {
@@ -353,6 +382,15 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
             })
             .catch(() => {});
         } catch (e) {}
+      } else {
+        if (onShowToast) {
+          onShowToast({
+            type: 'error',
+            text: lang === 'my'
+              ? `⚠️ လိုင်စင် Supabase Cloud တွင် သိမ်းဆည်းမရပါ: ${res.error || 'Network error'}`
+              : `⚠️ Failed to save license to Supabase Cloud: ${res.error || 'Network error'}`
+          });
+        }
       }
     } catch (err: any) {
       if (onShowToast) {
@@ -544,28 +582,50 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
   };
 
   // Save Contact Settings Handler
-  const handleSaveContactSettings = (e: React.FormEvent) => {
+  const handleSaveContactSettings = async (e: React.FormEvent) => {
     e.preventDefault();
-    onUpdateAdminContact(contactForm);
+    const res = await onUpdateAdminContact(contactForm);
+    if (res && res.success === false) {
+      if (onShowToast) {
+        onShowToast({
+          type: 'error',
+          text: lang === 'my'
+            ? `⚠️ Supabase Cloud သို့ သိမ်းဆည်းမရပါ: ${res.error || 'Network error'}`
+            : `⚠️ Cloud save failed: ${res.error || 'Network error'}`
+        });
+      }
+      return;
+    }
     setContactSavedSuccess(true);
     if (onShowToast) {
       onShowToast({
         type: 'success',
-        text: lang === 'my' ? 'Viber/Telegram ဆက်သွယ်ရန် နံပါတ်များ သိမ်းဆည်းပြီးပါပြီ' : 'Contact settings saved & synced!'
+        text: lang === 'my' ? 'Viber/Telegram ဆက်သွယ်ရန် နံပါတ်များ Supabase Cloud တွင် သိမ်းဆည်းပြီးပါပြီ' : 'Contact settings saved & synced live!'
       });
     }
     setTimeout(() => setContactSavedSuccess(false), 4000);
   };
 
   // Save Branding Handler
-  const handleSaveBranding = (e: React.FormEvent) => {
+  const handleSaveBranding = async (e: React.FormEvent) => {
     e.preventDefault();
     if (onUpdateAppBranding) {
-      onUpdateAppBranding(brandingForm);
+      const res = await onUpdateAppBranding(brandingForm);
+      if (res && res.success === false) {
+        if (onShowToast) {
+          onShowToast({
+            type: 'error',
+            text: lang === 'my'
+              ? `⚠️ Branding Supabase Cloud သို့ သိမ်းဆည်းမရပါ: ${res.error || 'Network error'}`
+              : `⚠️ Branding cloud sync failed: ${res.error || 'Network error'}`
+          });
+        }
+        return;
+      }
       if (onShowToast) {
         onShowToast({
           type: 'success',
-          text: lang === 'my' ? 'App Logo နှင့် နာမည် ပြင်ဆင်ပြီးပါပြီ' : 'Branding saved & synced!'
+          text: lang === 'my' ? 'App Logo နှင့် နာမည် Supabase Cloud တွင် ပြင်ဆင်ပြီးပါပြီ' : 'Branding saved & synced live!'
         });
       }
     }
@@ -589,26 +649,64 @@ export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({
     reader.readAsDataURL(file);
   };
 
-  const handleAddResourceSubmit = (e: React.FormEvent) => {
+  const handleAddResourceSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!resTitle || !resFileName) return;
-    onAddResource({
-      title: resTitle,
-      description: resDesc,
-      category: resCategory,
-      fileName: resFileName,
-      fileSize: resFileSize || '1.0 MB',
-      fileType: resFileType || 'application/pdf',
-      fileData: resFileData,
-      uploadedBy: 'SolarTech Admin',
-      isPaidOnly: true
-    });
-    setResTitle('');
-    setResDesc('');
-    setResFileName('');
-    setResFileData(undefined);
-    if (onShowToast) {
-      onShowToast({ type: 'success', text: 'Resource added to vault successfully!' });
+    if (!resTitle || !resFileName || isUploadingResource) return;
+    setIsUploadingResource(true);
+    try {
+      const res = await onAddResource({
+        title: resTitle,
+        description: resDesc,
+        category: resCategory,
+        fileName: resFileName,
+        fileSize: resFileSize || '1.0 MB',
+        fileType: resFileType || 'application/pdf',
+        fileData: resFileData,
+        uploadedBy: 'SolarTech Admin',
+        isPaidOnly: true
+      });
+      if (res && res.success === false) {
+        if (onShowToast) {
+          onShowToast({
+            type: 'error',
+            text: lang === 'my'
+              ? `⚠️ ဖိုင် Supabase Cloud သို့ တင်ရာတွင် မအောင်မြင်ပါ: ${res.error || 'Upload error'}`
+              : `⚠️ Resource cloud upload failed: ${res.error || 'Upload error'}`
+          });
+        }
+        return;
+      }
+      setResTitle('');
+      setResDesc('');
+      setResFileName('');
+      setResFileData(undefined);
+      if (resourceFileInputRef.current) resourceFileInputRef.current.value = '';
+    } finally {
+      setIsUploadingResource(false);
+    }
+  };
+
+  // Run Live Supabase Connection & Diagnostics Test
+  const handleTestSupabaseConnection = async () => {
+    setIsTestingSupabase(true);
+    setSupabaseDiag(null);
+    try {
+      const diag = await testSupabaseConnection(supabaseForm.url, supabaseForm.anonKey);
+      setSupabaseDiag(diag);
+      if (onShowToast) {
+        onShowToast({
+          type: diag.ok ? 'success' : 'error',
+          text: diag.ok
+            ? (lang === 'my'
+                ? `✅ Supabase ချိတ်ဆက်မှု ကောင်းမွန်ပါသည် (${diag.latencyMs}ms • Realtime ${diag.realtimeBroadcastOk ? 'OK' : 'Fallback'})`
+                : `✅ Supabase connected (${diag.latencyMs}ms • Realtime ${diag.realtimeBroadcastOk ? 'OK' : 'Fallback'})`)
+            : (lang === 'my'
+                ? `⚠️ Supabase ချိတ်ဆက်မှု မအောင်မြင်ပါ: ${diag.restError || 'Network error'}`
+                : `⚠️ Supabase connection failed: ${diag.restError || 'Network error'}`)
+        });
+      }
+    } finally {
+      setIsTestingSupabase(false);
     }
   };
 
@@ -1198,16 +1296,32 @@ ${lic.token}
                                 </span>
                               </div>
 
-                              <div className="flex items-center gap-2 text-xs text-slate-400">
+                              <div className="flex items-center gap-2 text-xs text-slate-400 flex-wrap">
                                 <span className="font-mono text-amber-300/90 font-bold">{lic.token}</span>
                                 <span>&middot;</span>
                                 <span className="font-bold text-slate-300">
                                   Devices: {boundCount}/{lic.deviceLimit}
                                 </span>
                                 {lic.boundDevices && lic.boundDevices.length > 0 && (
-                                  <span className="text-[10px] text-slate-500">
-                                    ({lic.boundDevices.map(b => b.deviceModel).join(', ')})
-                                  </span>
+                                  <div className="flex items-center gap-1 flex-wrap">
+                                    {lic.boundDevices.map((b, bIdx) => (
+                                      <span
+                                        key={b.deviceId || bIdx}
+                                        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[10px] text-slate-300"
+                                      >
+                                        <Laptop className="w-2.5 h-2.5 text-sky-400" />
+                                        <span>{b.deviceModel}</span>
+                                        <button
+                                          type="button"
+                                          onClick={() => onUnbindLicenseDevice(lic.id, b.deviceId)}
+                                          className="text-rose-400 hover:text-rose-300 ml-0.5 cursor-pointer"
+                                          title={`Unbind ${b.deviceModel}`}
+                                        >
+                                          <X className="w-2.5 h-2.5" />
+                                        </button>
+                                      </span>
+                                    ))}
+                                  </div>
                                 )}
                               </div>
                             </div>
@@ -1242,7 +1356,7 @@ ${lic.token}
                                   type="button"
                                   onClick={() => onUnbindLicenseDevice(lic.id, 'all')}
                                   className="px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-amber-300 text-[11px] font-bold cursor-pointer"
-                                  title="Unbind/Reset Devices"
+                                  title="Unbind/Reset All Devices"
                                 >
                                   Reset Devices
                                 </button>
@@ -1266,6 +1380,16 @@ ${lic.token}
                                 title="Extend +30 Days (1 Month)"
                               >
                                 +1M
+                              </button>
+
+                              {/* Extend +90 Days (3 Months) */}
+                              <button
+                                type="button"
+                                onClick={() => onExtendLicense(lic.id, 90)}
+                                className="px-2 py-1.5 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/40 text-indigo-300 text-[11px] font-bold cursor-pointer"
+                                title="Extend +90 Days (3 Months)"
+                              >
+                                +3M
                               </button>
 
                               {/* Revoke / Reactivate */}
@@ -1482,107 +1606,279 @@ ${lic.token}
               </form>
             )}
 
-            {/* TAB: DATABASE (INVERTERS & PANELS CSV) */}
+            {/* TAB: DATABASE (INVERTERS, PANELS & BATTERIES CSV / EXCEL) */}
             {activeTab === 'database' && (
               <div className="space-y-6">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                   <div>
                     <h4 className="font-extrabold text-sm text-white">
-                      {lang === 'my' ? 'Inverter နှင့် Solar Panel ဒေတာဘေ့စ်များ' : 'Equipment Database Management'}
+                      {lang === 'my' ? 'Inverter, Solar Panel နှင့် Battery ဒေတာဘေ့စ်များ' : 'Equipment Database Management'}
                     </h4>
                     <p className="text-xs text-slate-400">
-                      Inverters ({customInverters.length}), Panels ({customPanels.length}), Batteries ({customBatteries.length})
+                      Inverters ({customInverters.length}) &middot; Panels ({customPanels.length}) &middot; Batteries ({customBatteries.length})
                     </p>
                   </div>
 
-                  {onOpenMountingDatabase && (
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {onPullLatestFromCloud && (
+                      <button
+                        type="button"
+                        disabled={uploadingDbType !== null}
+                        onClick={async () => {
+                          setUploadingDbType('pull');
+                          setDbUploadFeedback(null);
+                          try {
+                            const res = await onPullLatestFromCloud();
+                            if (res.success) {
+                              const msg = lang === 'my'
+                                ? `✅ Supabase Cloud မှ နောက်ဆုံး Data ဆွဲယူပြီးပါပြီ (Inverter ${res.inverters}, Panel ${res.panels}, Battery ${res.batteries}, License ${res.licenses})`
+                                : `✅ Pulled latest from Supabase (Inverters: ${res.inverters}, Panels: ${res.panels}, Batteries: ${res.batteries}, Licenses: ${res.licenses})`;
+                              setDbUploadFeedback({ type: 'success', text: msg });
+                              if (onShowToast) onShowToast({ type: 'success', text: msg });
+                            } else {
+                              const errMsg = res.error || 'Cloud pull failed';
+                              setDbUploadFeedback({ type: 'error', text: errMsg });
+                              if (onShowToast) onShowToast({ type: 'error', text: errMsg });
+                            }
+                          } finally {
+                            setUploadingDbType(null);
+                          }
+                        }}
+                        className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 border border-slate-700"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${uploadingDbType === 'pull' ? 'animate-spin' : ''}`} />
+                        <span>{lang === 'my' ? 'Cloud မှ ပြန်ဆွဲမည်' : 'Pull Latest'}</span>
+                      </button>
+                    )}
+
                     <button
                       type="button"
-                      onClick={onOpenMountingDatabase}
-                      className="px-3.5 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5"
+                      disabled={isPublishing}
+                      onClick={handlePublishClick}
+                      className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5"
                     >
-                      <Database className="w-3.5 h-3.5" />
-                      <span>{lang === 'my' ? 'Mounting ဖရိန် Database ကြည့်မည်' : 'Mounting Database Suite'}</span>
+                      <Globe className={`w-3.5 h-3.5 ${isPublishing ? 'animate-spin' : ''}`} />
+                      <span>{lang === 'my' ? 'Database အားလုံး Supabase တင်မည်' : 'Sync All to Supabase'}</span>
                     </button>
-                  )}
+
+                    {onOpenMountingDatabase && (
+                      <button
+                        type="button"
+                        onClick={onOpenMountingDatabase}
+                        className="px-3 py-1.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5"
+                      >
+                        <Database className="w-3.5 h-3.5" />
+                        <span>{lang === 'my' ? 'Mounting ဖရိန် DB' : 'Mounting DB'}</span>
+                      </button>
+                    )}
+                  </div>
                 </div>
 
-                <div className="p-4 rounded-2xl bg-slate-950 border border-slate-800 space-y-3">
+                <div className="p-4 rounded-2xl bg-slate-950 border border-slate-800 space-y-4">
                   <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                     <span className="font-bold text-xs text-slate-300">
-                      CSV File Batch Upload (ဆိုလာပြား / အင်ဗာတာ ဖိုင်တင်ရန်)
+                      CSV / Excel (.csv, .xlsx, .xls) Batch Upload (Supabase Real-time Sync)
                     </span>
-                    <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-                      {lang === 'my' ? 'Supabase Auto-Sync ချိတ်ဆက်ထားသည် (GitHub တွင် တန်းပေါ်မည်)' : 'Supabase Live Cloud Sync Active (Auto on GitHub)'}
+                    <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-bold border ${
+                      realtimeStatus === 'connected'
+                        ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+                        : 'bg-amber-500/10 text-amber-400 border-amber-500/30'
+                    }`}>
+                      <span className={`w-1.5 h-1.5 rounded-full animate-pulse ${
+                        realtimeStatus === 'connected' ? 'bg-emerald-400' : 'bg-amber-400'
+                      }`}></span>
+                      {realtimeStatus === 'connected'
+                        ? (lang === 'my' ? 'Supabase Live WebSocket ချိတ်ဆက်ပြီး (Real-time)' : 'Supabase Live WebSocket Connected')
+                        : (lang === 'my' ? 'Supabase Auto-Sync ချိတ်ဆက်ထားသည်' : 'Supabase Auto-Sync Active')}
                     </span>
                   </div>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <div className="p-3 rounded-xl border border-dashed border-slate-700 bg-slate-900/60 space-y-2 text-center">
-                      <span className="text-xs font-bold text-slate-300 block">Inverters CSV Upload</span>
-                      <p className="text-[10px] text-amber-400/90 leading-tight">
-                        (CSV အသစ်တင်လျှင် အရင်စပက်ဟောင်းများ ပျောက်သွားပြီး အသစ်များဖြင့် အစားထိုးပါမည်။ ကိုယ်တိုင်ထည့်ထားသော Manual Items များကိုသာ ထိန်းသိမ်းပေးပါမည်)
+                  {dbUploadFeedback && (
+                    <div className={`p-3 rounded-xl border text-xs font-bold flex items-center gap-2 ${
+                      dbUploadFeedback.type === 'success'
+                        ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-300'
+                        : 'bg-rose-500/15 border-rose-500/30 text-rose-300'
+                    }`}>
+                      {dbUploadFeedback.type === 'success' ? <CheckCircle2 className="w-4 h-4 shrink-0" /> : <AlertTriangle className="w-4 h-4 shrink-0" />}
+                      <span>{dbUploadFeedback.text}</span>
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    {/* Inverters Upload */}
+                    <div className="p-3.5 rounded-xl border border-dashed border-slate-700 bg-slate-900/60 space-y-2.5 text-center">
+                      <div className="flex items-center justify-center gap-1.5 text-xs font-bold text-amber-300">
+                        <Cpu className="w-4 h-4" />
+                        <span>Inverters ({customInverters.length})</span>
+                      </div>
+                      <p className="text-[10px] text-slate-400 leading-tight">
+                        CSV / Excel တင်ပြီးတာနဲ့ Supabase Cloud မှတစ်ဆင့် User အားလုံးထံ Real-time ရောက်ပါမည် (Manual Items ထိန်းသိမ်းပေးသည်)
                       </p>
                       <input
                         type="file"
-                        accept=".csv"
+                        accept=".csv,.xlsx,.xls"
+                        disabled={uploadingDbType !== null}
                         onChange={async (e) => {
-                          const file = e.target.files?.[0];
+                          const inputEl = e.target;
+                          const file = inputEl.files?.[0];
                           if (!file) return;
+                          setUploadingDbType('inverters');
+                          setDbUploadFeedback(null);
                           try {
                             const list = await parseInvertersFile(file);
-                            if (list && list.length > 0 && onUpdateCustomInverters) {
-                              // Preserve ONLY manual items created by user via Custom Form
+                            if (!list || list.length === 0) {
+                              throw new Error(lang === 'my' ? 'ဖိုင်ထဲတွင် Inverter အချက်အလက် မတွေ့ပါ (Column ခေါင်းစဉ် စစ်ဆေးပါ)' : 'No valid inverter rows found in file');
+                            }
+                            if (onUpdateCustomInverters) {
                               const manualInverters = (customInverters || []).filter((inv: any) => 
                                 inv.id?.startsWith('custom_save_') || inv.isManual === true
                               );
                               const finalList = [...list, ...manualInverters];
-                              onUpdateCustomInverters(finalList);
-                              if (onShowToast) {
-                                onShowToast({ 
-                                  type: 'success', 
-                                  text: `အရင်စာရင်းဟောင်းများကို အသစ်လဲလှယ်ပြီး Inverter ${list.length} ခု အောင်မြင်စွာ တင်သွင်းပြီးပါပြီ!` 
-                                });
+                              const res = await onUpdateCustomInverters(finalList);
+                              if (res && res.success === false) {
+                                throw new Error(res.error || 'Supabase upload failed');
                               }
+                              const okText = lang === 'my'
+                                ? `✅ Inverter ${list.length} ခုကို Supabase Cloud သို့ တင်ပြီး User အားလုံးထံ Real-time Update ပို့ပြီးပါပြီ!`
+                                : `✅ Uploaded ${list.length} inverters to Supabase & broadcasted live!`;
+                              setDbUploadFeedback({ type: 'success', text: okText });
+                              if (onShowToast) onShowToast({ type: 'success', text: okText });
                             }
-                          } catch (err) {}
+                          } catch (err: any) {
+                            const errText = lang === 'my'
+                              ? `⚠️ Inverter တင်ရာတွင် မအောင်မြင်ပါ: ${err?.message || 'Invalid CSV/Excel file'}`
+                              : `⚠️ Inverter upload failed: ${err?.message || 'Invalid CSV/Excel file'}`;
+                            setDbUploadFeedback({ type: 'error', text: errText });
+                            if (onShowToast) onShowToast({ type: 'error', text: errText });
+                          } finally {
+                            setUploadingDbType(null);
+                            inputEl.value = '';
+                          }
                         }}
-                        className="text-xs text-slate-400"
+                        className="w-full text-[11px] text-slate-400 file:mr-2 file:py-1 file:px-2.5 file:rounded-lg file:border-0 file:text-[11px] file:font-bold file:bg-amber-500/20 file:text-amber-300 hover:file:bg-amber-500/30 cursor-pointer"
                       />
+                      {uploadingDbType === 'inverters' && (
+                        <div className="text-[11px] text-amber-400 font-bold flex items-center justify-center gap-1">
+                          <RefreshCw className="w-3 h-3 animate-spin" />
+                          <span>Uploading to Supabase...</span>
+                        </div>
+                      )}
                     </div>
 
-                    <div className="p-3 rounded-xl border border-dashed border-slate-700 bg-slate-900/60 space-y-2 text-center">
-                      <span className="text-xs font-bold text-slate-300 block">Panels CSV Upload</span>
-                      <p className="text-[10px] text-amber-400/90 leading-tight">
-                        (CSV အသစ်တင်လျှင် အရင်စပက်ဟောင်းများ ပျောက်သွားပြီး အသစ်များဖြင့် အစားထိုးပါမည်။ ကိုယ်တိုင်ထည့်ထားသော Manual Items များကိုသာ ထိန်းသိမ်းပေးပါမည်)
+                    {/* Panels Upload */}
+                    <div className="p-3.5 rounded-xl border border-dashed border-slate-700 bg-slate-900/60 space-y-2.5 text-center">
+                      <div className="flex items-center justify-center gap-1.5 text-xs font-bold text-sky-300">
+                        <Sun className="w-4 h-4" />
+                        <span>Solar Panels ({customPanels.length})</span>
+                      </div>
+                      <p className="text-[10px] text-slate-400 leading-tight">
+                        CSV / Excel တင်ပြီးတာနဲ့ Supabase Cloud မှတစ်ဆင့် User အားလုံးထံ Real-time ရောက်ပါမည် (Manual Items ထိန်းသိမ်းပေးသည်)
                       </p>
                       <input
                         type="file"
-                        accept=".csv"
+                        accept=".csv,.xlsx,.xls"
+                        disabled={uploadingDbType !== null}
                         onChange={async (e) => {
-                          const file = e.target.files?.[0];
+                          const inputEl = e.target;
+                          const file = inputEl.files?.[0];
                           if (!file) return;
+                          setUploadingDbType('panels');
+                          setDbUploadFeedback(null);
                           try {
                             const list = await parseSolarPanelsFile(file);
-                            if (list && list.length > 0 && onUpdateCustomPanels) {
-                              // Preserve ONLY manual items created by user via Custom Form
+                            if (!list || list.length === 0) {
+                              throw new Error(lang === 'my' ? 'ဖိုင်ထဲတွင် Solar Panel အချက်အလက် မတွေ့ပါ (Column ခေါင်းစဉ် စစ်ဆေးပါ)' : 'No valid solar panel rows found in file');
+                            }
+                            if (onUpdateCustomPanels) {
                               const manualPanels = (customPanels || []).filter((p: any) => 
                                 p.id?.startsWith('custom_save_') || p.isManual === true
                               );
                               const finalList = [...list, ...manualPanels];
-                              onUpdateCustomPanels(finalList);
-                              if (onShowToast) {
-                                onShowToast({ 
-                                  type: 'success', 
-                                  text: `အရင်စာရင်းဟောင်းများကို အသစ်လဲလှယ်ပြီး Panel ${list.length} ခု အောင်မြင်စွာ တင်သွင်းပြီးပါပြီ!` 
-                                });
+                              const res = await onUpdateCustomPanels(finalList);
+                              if (res && res.success === false) {
+                                throw new Error(res.error || 'Supabase upload failed');
                               }
+                              const okText = lang === 'my'
+                                ? `✅ Solar Panel ${list.length} ခုကို Supabase Cloud သို့ တင်ပြီး User အားလုံးထံ Real-time Update ပို့ပြီးပါပြီ!`
+                                : `✅ Uploaded ${list.length} panels to Supabase & broadcasted live!`;
+                              setDbUploadFeedback({ type: 'success', text: okText });
+                              if (onShowToast) onShowToast({ type: 'success', text: okText });
                             }
-                          } catch (err) {}
+                          } catch (err: any) {
+                            const errText = lang === 'my'
+                              ? `⚠️ Panel တင်ရာတွင် မအောင်မြင်ပါ: ${err?.message || 'Invalid CSV/Excel file'}`
+                              : `⚠️ Panel upload failed: ${err?.message || 'Invalid CSV/Excel file'}`;
+                            setDbUploadFeedback({ type: 'error', text: errText });
+                            if (onShowToast) onShowToast({ type: 'error', text: errText });
+                          } finally {
+                            setUploadingDbType(null);
+                            inputEl.value = '';
+                          }
                         }}
-                        className="text-xs text-slate-400"
+                        className="w-full text-[11px] text-slate-400 file:mr-2 file:py-1 file:px-2.5 file:rounded-lg file:border-0 file:text-[11px] file:font-bold file:bg-sky-500/20 file:text-sky-300 hover:file:bg-sky-500/30 cursor-pointer"
                       />
+                      {uploadingDbType === 'panels' && (
+                        <div className="text-[11px] text-sky-400 font-bold flex items-center justify-center gap-1">
+                          <RefreshCw className="w-3 h-3 animate-spin" />
+                          <span>Uploading to Supabase...</span>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Batteries Upload */}
+                    <div className="p-3.5 rounded-xl border border-dashed border-slate-700 bg-slate-900/60 space-y-2.5 text-center">
+                      <div className="flex items-center justify-center gap-1.5 text-xs font-bold text-emerald-300">
+                        <Battery className="w-4 h-4" />
+                        <span>Batteries ({customBatteries.length})</span>
+                      </div>
+                      <p className="text-[10px] text-slate-400 leading-tight">
+                        Battery CSV / Excel တင်ပြီးတာနဲ့ Supabase Cloud မှတစ်ဆင့် User အားလုံးထံ Real-time Update ဖြစ်ပါမည်
+                      </p>
+                      <input
+                        type="file"
+                        accept=".csv,.xlsx,.xls"
+                        disabled={uploadingDbType !== null}
+                        onChange={async (e) => {
+                          const inputEl = e.target;
+                          const file = inputEl.files?.[0];
+                          if (!file) return;
+                          setUploadingDbType('batteries');
+                          setDbUploadFeedback(null);
+                          try {
+                            const list = await parseBatteriesFile(file);
+                            if (!list || list.length === 0) {
+                              throw new Error(lang === 'my' ? 'ဖိုင်ထဲတွင် Battery အချက်အလက် မတွေ့ပါ' : 'No valid battery rows found in file');
+                            }
+                            if (onUpdateCustomBatteries) {
+                              const res = await onUpdateCustomBatteries(list);
+                              if (res && res.success === false) {
+                                throw new Error(res.error || 'Supabase upload failed');
+                              }
+                              const okText = lang === 'my'
+                                ? `✅ Battery ${list.length} ခုကို Supabase Cloud သို့ တင်ပြီး User အားလုံးထံ Real-time Update ပို့ပြီးပါပြီ!`
+                                : `✅ Uploaded ${list.length} batteries to Supabase & broadcasted live!`;
+                              setDbUploadFeedback({ type: 'success', text: okText });
+                              if (onShowToast) onShowToast({ type: 'success', text: okText });
+                            }
+                          } catch (err: any) {
+                            const errText = lang === 'my'
+                              ? `⚠️ Battery တင်ရာတွင် မအောင်မြင်ပါ: ${err?.message || 'Invalid CSV/Excel file'}`
+                              : `⚠️ Battery upload failed: ${err?.message || 'Invalid CSV/Excel file'}`;
+                            setDbUploadFeedback({ type: 'error', text: errText });
+                            if (onShowToast) onShowToast({ type: 'error', text: errText });
+                          } finally {
+                            setUploadingDbType(null);
+                            inputEl.value = '';
+                          }
+                        }}
+                        className="w-full text-[11px] text-slate-400 file:mr-2 file:py-1 file:px-2.5 file:rounded-lg file:border-0 file:text-[11px] file:font-bold file:bg-emerald-500/20 file:text-emerald-300 hover:file:bg-emerald-500/30 cursor-pointer"
+                      />
+                      {uploadingDbType === 'batteries' && (
+                        <div className="text-[11px] text-emerald-400 font-bold flex items-center justify-center gap-1">
+                          <RefreshCw className="w-3 h-3 animate-spin" />
+                          <span>Uploading to Supabase...</span>
+                        </div>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -1641,6 +1937,7 @@ ${lic.token}
                     <div className="sm:col-span-2">
                       <label className="text-xs font-bold text-slate-300 block mb-1">File Attachment (PDF, CSV, PNG, etc.)</label>
                       <input
+                        ref={resourceFileInputRef}
                         type="file"
                         onChange={handleResourceFileSelect}
                         className="w-full text-xs text-slate-400"
@@ -1651,9 +1948,11 @@ ${lic.token}
 
                   <button
                     type="submit"
-                    className="py-2.5 px-5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-bold text-xs shadow-md transition-all cursor-pointer"
+                    disabled={isUploadingResource}
+                    className="py-2.5 px-5 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-bold text-xs shadow-md transition-all cursor-pointer flex items-center gap-2"
                   >
-                    Upload File to Vault
+                    {isUploadingResource && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
+                    <span>{isUploadingResource ? (lang === 'my' ? 'Supabase Cloud သို့ တင်နေသည်...' : 'Uploading to Supabase...') : 'Upload File to Vault'}</span>
                   </button>
                 </form>
 
@@ -2167,13 +2466,33 @@ ${lic.token}
 
             {/* TAB: SUPABASE CLOUD SYNC */}
             {activeTab === 'supabase' && (
-              <div className="space-y-4 max-w-xl">
-                <div className="p-4 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 text-xs text-emerald-300 space-y-1">
-                  <span className="font-bold block text-sm text-white">Supabase Cloud Database Connection</span>
+              <div className="space-y-5 max-w-2xl">
+                <div className="p-4 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 text-xs text-emerald-300 space-y-2">
+                  <div className="flex items-center justify-between flex-wrap gap-2">
+                    <span className="font-bold text-sm text-white">Supabase Cloud Database & Realtime Sync</span>
+                    <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-bold border ${
+                      realtimeStatus === 'connected'
+                        ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                        : realtimeStatus === 'reconnecting'
+                        ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                        : 'bg-sky-500/20 text-sky-300 border-sky-500/40'
+                    }`}>
+                      <span className={`w-2 h-2 rounded-full animate-pulse ${
+                        realtimeStatus === 'connected' ? 'bg-emerald-400' : realtimeStatus === 'reconnecting' ? 'bg-amber-400' : 'bg-sky-400'
+                      }`} />
+                      {realtimeStatus === 'connected'
+                        ? 'Live WebSocket Connected'
+                        : realtimeStatus === 'reconnecting'
+                        ? 'Reconnecting WebSocket...'
+                        : realtimeStatus === 'polling'
+                        ? '3s Cloud Auto-Poll Active'
+                        : 'Connecting Realtime...'}
+                    </span>
+                  </div>
                   <p>
                     {supabaseConfig.isConnected
-                      ? '✅ Supabase Cloud ချိတ်ဆက်ထားပြီး ဖြစ်ပါသည်။ Real-time multi-device sync အလုပ်လုပ်နေပါသည်။'
-                      : '⚠️ Supabase credentials မထည့်သွင်းရသေးပါ။ စနစ်သည် Express server local storage ဖြင့် အလုပ်လုပ်နေပါသည်။'}
+                      ? '✅ Supabase Cloud ချိတ်ဆက်ထားပြီး ဖြစ်ပါသည်။ Admin မှ License ထုတ်ခြင်း၊ Database CSV/Excel တင်ခြင်းနှင့် File Upload အားလုံး GitHub Pages အသုံးပြုသူတိုင်းထံ Real-time ရောက်ရှိပါမည်။'
+                      : '⚠️ Supabase credentials မထည့်သွင်းရသေးပါ။'}
                   </p>
                 </div>
 
@@ -2200,21 +2519,113 @@ ${lic.token}
                     />
                   </div>
 
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onUpdateSupabaseConfig({
-                        url: supabaseForm.url.trim(),
-                        anonKey: supabaseForm.anonKey.trim(),
-                        isConnected: Boolean(supabaseForm.url.trim() && supabaseForm.anonKey.trim())
-                      });
-                      if (onShowToast) onShowToast({ type: 'success', text: 'Supabase credentials saved!' });
-                    }}
-                    className="py-2.5 px-5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow-md transition-all cursor-pointer"
-                  >
-                    Save Supabase Credentials
-                  </button>
+                  <div className="flex items-center gap-2.5 flex-wrap pt-1">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onUpdateSupabaseConfig({
+                          url: supabaseForm.url.trim(),
+                          anonKey: supabaseForm.anonKey.trim(),
+                          isConnected: Boolean(supabaseForm.url.trim() && supabaseForm.anonKey.trim())
+                        });
+                      }}
+                      className="py-2.5 px-5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow-md transition-all cursor-pointer flex items-center gap-1.5"
+                    >
+                      <Save className="w-3.5 h-3.5" />
+                      <span>Save & Reconnect</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={isTestingSupabase}
+                      onClick={handleTestSupabaseConnection}
+                      className="py-2.5 px-4 rounded-xl bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-bold text-xs shadow-md transition-all cursor-pointer flex items-center gap-1.5"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${isTestingSupabase ? 'animate-spin' : ''}`} />
+                      <span>{isTestingSupabase ? 'Testing...' : 'Test Connection & Diagnostics'}</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const defCfg: SupabaseConfig = {
+                          url: DEFAULT_SUPABASE_URL,
+                          anonKey: DEFAULT_SUPABASE_ANON_KEY,
+                          isConnected: true
+                        };
+                        setSupabaseForm(defCfg);
+                        onUpdateSupabaseConfig(defCfg);
+                      }}
+                      className="py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs border border-slate-700 transition-all cursor-pointer"
+                    >
+                      Reset to Default Cloud
+                    </button>
+                  </div>
                 </div>
+
+                {/* Live Diagnostics Panel */}
+                {supabaseDiag && (
+                  <div className={`p-4 rounded-2xl border space-y-3 text-xs ${
+                    supabaseDiag.ok
+                      ? 'bg-slate-950 border-emerald-500/40'
+                      : 'bg-rose-950/30 border-rose-500/40'
+                  }`}>
+                    <div className="flex items-center justify-between">
+                      <span className="font-extrabold text-white flex items-center gap-2">
+                        {supabaseDiag.ok
+                          ? <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                          : <AlertTriangle className="w-4 h-4 text-rose-400" />}
+                        <span>Cloud Diagnostics Result</span>
+                      </span>
+                      <span className="font-mono text-[11px] text-slate-400">{supabaseDiag.latencyMs} ms</span>
+                    </div>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                      <div className="p-2.5 rounded-xl bg-slate-900 border border-slate-800">
+                        <span className="text-[10px] text-slate-400 block">REST app_settings</span>
+                        <span className={`font-bold ${supabaseDiag.restOk ? 'text-emerald-400' : 'text-rose-400'}`}>
+                          {supabaseDiag.restOk ? `OK (${supabaseDiag.rowsCount} rows)` : 'FAILED'}
+                        </span>
+                      </div>
+                      <div className="p-2.5 rounded-xl bg-slate-900 border border-slate-800">
+                        <span className="text-[10px] text-slate-400 block">Realtime Broadcast</span>
+                        <span className={`font-bold ${supabaseDiag.realtimeBroadcastOk ? 'text-emerald-400' : 'text-amber-400'}`}>
+                          {supabaseDiag.realtimeBroadcastOk ? 'LIVE OK' : 'Polling Fallback'}
+                        </span>
+                      </div>
+                      <div className="p-2.5 rounded-xl bg-slate-900 border border-slate-800">
+                        <span className="text-[10px] text-slate-400 block">Licenses in Cloud</span>
+                        <span className="font-bold text-amber-300 font-mono">{supabaseDiag.counts.licenses}</span>
+                      </div>
+                      <div className="p-2.5 rounded-xl bg-slate-900 border border-slate-800">
+                        <span className="text-[10px] text-slate-400 block">Inverters in Cloud</span>
+                        <span className="font-bold text-white font-mono">{supabaseDiag.counts.inverters}</span>
+                      </div>
+                      <div className="p-2.5 rounded-xl bg-slate-900 border border-slate-800">
+                        <span className="text-[10px] text-slate-400 block">Panels in Cloud</span>
+                        <span className="font-bold text-white font-mono">{supabaseDiag.counts.panels}</span>
+                      </div>
+                      <div className="p-2.5 rounded-xl bg-slate-900 border border-slate-800">
+                        <span className="text-[10px] text-slate-400 block">Batteries / Mount / Files</span>
+                        <span className="font-bold text-white font-mono">
+                          {supabaseDiag.counts.batteries} / {supabaseDiag.counts.mountingPanels} / {supabaseDiag.counts.resources}
+                        </span>
+                      </div>
+                    </div>
+
+                    {supabaseDiag.lastPublishedAt && (
+                      <div className="text-[11px] text-slate-400">
+                        Last Cloud Publish: <span className="font-mono text-slate-200">{new Date(supabaseDiag.lastPublishedAt).toLocaleString()}</span>
+                      </div>
+                    )}
+                    {supabaseDiag.restError && (
+                      <div className="text-[11px] text-rose-400 font-mono">REST Error: {supabaseDiag.restError}</div>
+                    )}
+                    {supabaseDiag.realtimeError && (
+                      <div className="text-[11px] text-amber-400 font-mono">Realtime Notice: {supabaseDiag.realtimeError}</div>
+                    )}
+                  </div>
+                )}
               </div>
             )}
           </div>
